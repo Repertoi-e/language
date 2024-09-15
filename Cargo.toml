@@ -1,0 +1,22 @@
+[package]
+name = "language"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+itertools = "0.13.0"
+rand = "0.8.5"
+
+clap = { version = "4.5", features = ["derive"] }
+rustyline = "14.0.0"
+
+anstream = "0.6.15"
+anstyle = "1.0.8"
+
+bumpalo = { path = "bumpalo", features = ["collections"] }
+
+unicode-properties = "0.1.2"
+unicode-width = "0.1.11"
+
+fixed = "1.28.0"
+num-bigint = "0.4.6"
