@@ -156,7 +156,6 @@ pub(crate) fn parse_impl(input: &str) -> Result<FloatLit<&str>, ParseError> {
         if rest.as_bytes().get(1) == Some(&b'_') {
             return Err(perr(end_integer_part + 1, UnexpectedChar));
         }
-
         end_dec_digits(rest[1..].as_bytes()) + 1 + end_integer_part
     } else {
         end_integer_part
