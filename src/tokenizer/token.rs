@@ -1,4 +1,9 @@
-use std::ops::Range;
+use std::{num::NonZeroUsize, ops::Range};
+
+use bumpalo::Bump;
+
+use string_interner::symbol::SymbolU32;
+type Atom = SymbolU32;
 
 pub enum IntegerValue {
     I8(i8),
@@ -27,33 +32,25 @@ pub enum FloatValue {
 }
 
 #[derive(Debug)]
-pub enum StringLiteralValue<'s> {
-    String(&'s str),
-    Bytes(&'s [u8])
-}
-
-#[derive(Debug)]
-pub struct StringLiteral<'s> {
-    pub is_raw: bool,      // Helper bool to prevent the need to parse 'begin'
-    pub is_byte: bool,     // Helper bool to prevent the need to parse 'begin'
-
+pub struct StringLiteral {
     pub begin: Range<usize>,    // All the characters that began the string literal, e.g.  br##"
     pub end: Range<usize>,      // The characters that ended the quote, e.g "##
 
-    pub content: StringLiteralValue<'s>,  // The content of the string, without the quotes, suffixes and prefixes
+    pub is_byte_string: bool,
+    pub content: Atom,          // The content of the string, without the quotes, suffixes and prefixes
     
-    pub suffix: Option<Range<usize>>,     // A literal optionally ends with an identifier suffix, e.g. "..."custom_suffix
+    pub suffix: Option<Atom>,     // A literal optionally ends with an identifier suffix, e.g. "..."custom_suffix
 }
 
 #[derive(Debug)]
 pub enum TokenValue<'s> {
-    WhiteSpace,    // a sequence of arbitrary unicode white space
-    NewLine,       // \n
+    WhiteSpace,          // a sequence of arbitrary unicode white space
+    NewLine,             // \n
 
-    Comment,       // // or /**/ 
+    Comment,             // // or /**/ 
     
-    Directive,     // #[ident]
-    Identifier,    // any sequence of alphanumeric unicode characters or _, starting with alphabetic or underscore
+    Directive(Atom),     // #[ident]
+    Identifier(Atom),    // any sequence of alphanumeric unicode characters or _, starting with alphabetic or underscore
 
     As,       // as
     With,     // with
@@ -95,7 +92,7 @@ pub enum TokenValue<'s> {
     NonLocal, // nonlocal
     Lambda,   // lambda
     
-    String(StringLiteral<'s>), // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
+    String(Box<StringLiteral, &'s Bump>), // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
     Number,
 
     True,                // True
@@ -186,3 +183,6 @@ pub struct Token<'s> {
     pub value: TokenValue<'s>,
     pub code_location: Range<usize>, // Begin and end bytes
 }
+
+// Index within a BucketArray<Token>
+pub type TokenIndex = NonZeroUsize;

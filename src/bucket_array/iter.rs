@@ -1,9 +1,9 @@
+use std::vec;
+
 use super::{Bucket, BucketArray};
 
-use bumpalo::collections::vec;
-
 #[derive(Debug, Clone)]
-pub struct Iter<'bump, T, const C: usize, const G: usize> {
+pub struct Iter<'bump, T> {
     buckets: core::slice::Iter<'bump, Bucket<'bump, T>>, // Buckets iterator.
     front_iter: Option<core::slice::Iter<'bump, T>>, // Front iterator for `next`.
     back_iter: Option<core::slice::Iter<'bump, T>>, // Back iterator for `next_back`.
@@ -12,8 +12,8 @@ pub struct Iter<'bump, T, const C: usize, const G: usize> {
     len: usize, 
 }
 
-impl<'bump, T, const C: usize, const G: usize> Iter<'bump, T, C, G> {
-    pub(crate) fn new(arr: &'bump BucketArray<'bump, T, C, G>) -> Self {
+impl<'bump, T> Iter<'bump, T> {
+    pub(crate) fn new(arr: &'bump BucketArray<'bump, T>) -> Self {
         Self {
             buckets: arr.buckets.iter(),
             front_iter: None,
@@ -23,7 +23,7 @@ impl<'bump, T, const C: usize, const G: usize> Iter<'bump, T, C, G> {
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> Iterator for Iter<'bump, T, C, G> {
+impl<'bump, T> Iterator for Iter<'bump, T> {
     type Item = &'bump T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -49,7 +49,7 @@ impl<'bump, T, const C: usize, const G: usize> Iterator for Iter<'bump, T, C, G>
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> DoubleEndedIterator for Iter<'bump, T, C, G> {
+impl<'bump, T> DoubleEndedIterator for Iter<'bump, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(ref mut back_iter) = self.back_iter {
@@ -70,7 +70,7 @@ impl<'bump, T, const C: usize, const G: usize> DoubleEndedIterator for Iter<'bum
 }
 
 #[derive(Debug)]
-pub struct IterMut<'bump, T, const C: usize, const G: usize> {
+pub struct IterMut<'bump, T> {
     buckets: core::slice::IterMut<'bump, Bucket<'bump, T>>, // Buckets iterator used by forward iteration.
     front_iter: Option<core::slice::IterMut<'bump, T>>, // Front iterator for `next`.
     back_iter: Option<core::slice::IterMut<'bump, T>>, // Back iterator for `next_back`.
@@ -79,8 +79,8 @@ pub struct IterMut<'bump, T, const C: usize, const G: usize> {
     len: usize,
 }
 
-impl<'bump, T, const C: usize, const G: usize> IterMut<'bump, T, C, G> {
-    pub(crate) fn new(arr: &'bump mut BucketArray<'bump, T, C, G>) -> Self {
+impl<'bump, T> IterMut<'bump, T> {
+    pub(crate) fn new(arr: &'bump mut BucketArray<'bump, T>) -> Self {
         let len = arr.len;
         Self {
             buckets: arr.buckets.iter_mut(),
@@ -91,7 +91,7 @@ impl<'bump, T, const C: usize, const G: usize> IterMut<'bump, T, C, G> {
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> Iterator for IterMut<'bump, T, C, G> {
+impl<'bump, T> Iterator for IterMut<'bump, T> {
     type Item = &'bump mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -117,7 +117,7 @@ impl<'bump, T, const C: usize, const G: usize> Iterator for IterMut<'bump, T, C,
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> DoubleEndedIterator for IterMut<'bump, T, C, G> {
+impl<'bump, T> DoubleEndedIterator for IterMut<'bump, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(ref mut back_iter) = self.back_iter {
@@ -138,17 +138,17 @@ impl<'bump, T, const C: usize, const G: usize> DoubleEndedIterator for IterMut<'
 }
 
 #[derive(Debug)]
-pub struct IntoIter<'bump, T, const C: usize, const G: usize> {
-    buckets: vec::IntoIter<'bump, Bucket<'bump, T>>, // Buckets iterator used by forward iteration.
-    front_iter: Option<vec::IntoIter<'bump, T>>, // Front iterator for `next`.
-    back_iter: Option<vec::IntoIter<'bump, T>>, // Back iterator for `next_back`.
+pub struct IntoIter<'bump, T> {
+    buckets: vec::IntoIter<Bucket<'bump, T>>, // Buckets iterator used by forward iteration.
+    front_iter: Option<vec::IntoIter<T>>, // Front iterator for `next`.
+    back_iter: Option<vec::IntoIter<T>>, // Back iterator for `next_back`.
     
     // Number of elements that are to be yielded by the iterator.
     len: usize,
 }
 
-impl<'bump, T, const C: usize, const G: usize> IntoIter<'bump, T, C, G> {
-    pub(crate) fn new(arr: BucketArray<'bump, T, C, G>) -> Self {
+impl<'bump, T> IntoIter<'bump, T> {
+    pub(crate) fn new(arr: BucketArray<T>) -> Self {
         let len = arr.len;
         Self {
             buckets: arr.buckets.into_iter(),
@@ -159,7 +159,7 @@ impl<'bump, T, const C: usize, const G: usize> IntoIter<'bump, T, C, G> {
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> Iterator for IntoIter<'bump, T, C, G> {
+impl<'bump, T> Iterator for IntoIter<'bump, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -185,7 +185,7 @@ impl<'bump, T, const C: usize, const G: usize> Iterator for IntoIter<'bump, T, C
     }
 }
 
-impl<'bump, T, const C: usize, const G: usize> DoubleEndedIterator for IntoIter<'bump, T, C, G> {
+impl<'bump, T> DoubleEndedIterator for IntoIter<'bump, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(ref mut back_iter) = self.back_iter {

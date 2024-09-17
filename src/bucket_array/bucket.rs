@@ -1,15 +1,15 @@
-use bumpalo::collections::Vec;
-use bumpalo::collections::vec::IntoIter;
+use std::vec::IntoIter;
+
 use bumpalo::Bump;
 
 #[derive(Debug, Clone)]
-pub struct Bucket<'bump, T, const STARTING_CAPACITY: usize = 10, const GROWTH_RATE: usize = 2> {
-    pub entries: Vec<'bump, T>,
+pub struct Bucket<'bump, T> {
+    pub entries: Vec<T, &'bump Bump>,
 }
 
 impl<'bump, T> Bucket<'bump, T> {
-    pub fn new(capacity: usize, bump: &'bump Bump) -> Self {
-        Bucket { entries: Vec::with_capacity_in(capacity, bump) }
+    pub fn new_in(capacity: usize, bump: &'bump Bump) -> Self {
+        Bucket { entries: Vec::<T, &Bump>::with_capacity_in(capacity, bump) }
     }
 
     pub fn push(&mut self, new_value: T) {
@@ -27,7 +27,7 @@ impl<'bump, T> Bucket<'bump, T> {
 
 impl<'bump, T> IntoIterator for Bucket<'bump, T> {
     type Item = T;
-    type IntoIter = IntoIter<'bump, T>;
+    type IntoIter = IntoIter<T, &'bump Bump>;
     fn into_iter(self) -> Self::IntoIter { self.entries.into_iter() }
 }
 

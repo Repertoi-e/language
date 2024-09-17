@@ -64,7 +64,6 @@ mod bucket;
 mod iter;
 
 use bumpalo::Bump;
-use bumpalo::collections::Vec;
 
 use self::bucket::Bucket;
 pub use self::iter::{IntoIter, Iter, IterMut};
@@ -137,37 +136,40 @@ pub use self::iter::{IntoIter, Iter, IterMut};
 /// entry_index(i) = i % N
 /// ```
 
+const STARTING_CAPACITY: usize = 8000;
+const GROWTH_RATE: usize = 1;
+
 #[derive(Debug)]
-pub struct BucketArray<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> {
+pub struct BucketArray<'bump, T> {
     len: usize,
-    buckets: Vec<'bump, Bucket<'bump, T>>,
+    buckets: Vec<Bucket<'bump, T>, &'bump Bump>,
     bump: &'bump Bump // The bump arena memory is allocated to 
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> IntoIterator for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> {
+impl<'bump, T> IntoIterator for BucketArray<'bump, T> {
     type Item = T;
-    type IntoIter = IntoIter<'bump, T, STARTING_CAPACITY, GROWTH_RATE>;
+    type IntoIter = IntoIter<'bump, T>;
 
     fn into_iter(self) -> Self::IntoIter { IntoIter::new(self) }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> IntoIterator for &'bump BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> {
+impl<'bump, T> IntoIterator for &'bump BucketArray<'bump, T> {
     type Item = &'bump T;
-    type IntoIter = Iter<'bump, T, STARTING_CAPACITY, GROWTH_RATE>;
+    type IntoIter = Iter<'bump, T>;
 
     fn into_iter(self) -> Self::IntoIter { Iter::new(self)}
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> IntoIterator for &'bump mut BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> {
+impl<'bump, T> IntoIterator for &'bump mut BucketArray<'bump, T> {
     type Item = &'bump mut T;
-    type IntoIter = IterMut<'bump, T, STARTING_CAPACITY, GROWTH_RATE>;
+    type IntoIter = IterMut<'bump, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         IterMut::new(self)
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> Clone for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> Clone for BucketArray<'bump, T>
 where
     T: Clone,
 {
@@ -180,16 +182,16 @@ where
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> PartialEq for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> PartialEq for BucketArray<'bump, T>
 where
     T: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool { self.iter().zip(other.iter()).all(|(lhs, rhs)| lhs == rhs) }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> Eq for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> where T: Eq {}
+impl<'bump, T> Eq for BucketArray<'bump, T> where T: Eq {}
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> core::cmp::PartialOrd for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> core::cmp::PartialOrd for BucketArray<'bump, T>
 where
     T: core::cmp::PartialOrd,
 {
@@ -204,7 +206,7 @@ where
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> core::cmp::Ord for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> core::cmp::Ord for BucketArray<'bump, T>
 where
     T: core::cmp::Ord,
 {
@@ -219,7 +221,7 @@ where
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> core::hash::Hash for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> core::hash::Hash for BucketArray<'bump, T>
 where
     T: core::hash::Hash,
 {
@@ -231,17 +233,17 @@ where
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> {
+impl<'bump, T> BucketArray<'bump, T> {
     pub fn new_in(bump: &'bump Bump) -> Self {
         Self {
             len: 0,
-            buckets: Vec::new_in(bump),
+            buckets: Vec::<_, &'bump Bump>::new_in(&bump),
             bump: bump,
         }
     }
 
-    pub fn iter(&self) -> Iter<T, STARTING_CAPACITY, GROWTH_RATE> { Iter::new(self) }
-    pub fn iter_mut(&'bump mut self) -> IterMut<T, STARTING_CAPACITY, GROWTH_RATE> { IterMut::new(self) }
+    pub fn iter(&self) -> Iter<T> { Iter::new(self) }
+    pub fn iter_mut(&'bump mut self) -> IterMut<T> { IterMut::new(self) }
 
     pub fn first(&self) -> Option<&T> {
         if self.buckets.is_empty() { return None }
@@ -268,12 +270,16 @@ impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketA
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> BucketArray<'bump, T>
 {
     // Returns the total capacity of all buckets up to (and including) the bucket indexed by `index`.
     pub fn total_capacity(index: usize) -> usize
     {
-        STARTING_CAPACITY * (GROWTH_RATE.pow(index as u32) - 1) / (GROWTH_RATE - 1)
+        if GROWTH_RATE == 1 {
+            (index / STARTING_CAPACITY + 1) * STARTING_CAPACITY
+        } else {
+            STARTING_CAPACITY * (GROWTH_RATE.pow(index as u32) - 1) / (GROWTH_RATE - 1)
+        }
     }
 
     /// Returns the capacity of the indexed bucket.
@@ -322,11 +328,11 @@ impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketA
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE> {
+impl<'bump, T> BucketArray<'bump, T> {
     fn push_bucket(&mut self, new_value: T) {
         let len_buckets = self.buckets.len();
         let new_capacity = Self::bucket_capacity(len_buckets);
-        let mut new_bucket = Bucket::new(new_capacity, self.bump);
+        let mut new_bucket = Bucket::new_in(new_capacity, self.bump);
         new_bucket.push(new_value);
         self.buckets.push(new_bucket);
         self.len += 1;
@@ -354,7 +360,7 @@ impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> BucketA
     }
 }
 
-impl<'bump, T, const STARTING_CAPACITY: usize, const GROWTH_RATE: usize> core::iter::Extend<T> for BucketArray<'bump, T, STARTING_CAPACITY, GROWTH_RATE>
+impl<'bump, T> core::iter::Extend<T> for BucketArray<'bump, T>
 {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for item in iter {

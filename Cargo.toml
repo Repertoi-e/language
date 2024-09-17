@@ -1,3 +1,9 @@
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+
 [package]
 name = "language"
 version = "0.1.0"
@@ -12,7 +18,8 @@ rustyline = "14.0.0"
 anstream = "0.6.15"
 anstyle = "1.0.8"
 
-bumpalo = { path = "bumpalo", features = ["collections"] }
+bumpalo = { path = "bumpalo" }
+string-interner = { path = "string-interner", features = ["inline-more"] }
 
 unicode-properties = "0.1.2"
 unicode-width = "0.1.11"
