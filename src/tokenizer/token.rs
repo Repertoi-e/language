@@ -1,9 +1,8 @@
 use std::{num::NonZeroUsize, ops::Range};
 
-use bumpalo::Bump;
-
 use string_interner::symbol::SymbolU32;
-type Atom = SymbolU32;
+
+pub type Atom = SymbolU32;
 
 pub enum IntegerValue {
     I8(i8),
@@ -31,6 +30,7 @@ pub enum FloatValue {
     F64(f64)
 }
 
+// TODO: Get rid of this since it's supposed to be for the AST
 #[derive(Debug)]
 pub struct StringLiteral {
     pub begin: Range<usize>,    // All the characters that began the string literal, e.g.  br##"
@@ -43,7 +43,7 @@ pub struct StringLiteral {
 }
 
 #[derive(Debug)]
-pub enum TokenValue<'s> {
+pub enum TokenValue<'mem> {
     WhiteSpace,          // a sequence of arbitrary unicode white space
     NewLine,             // \n
 
@@ -51,58 +51,12 @@ pub enum TokenValue<'s> {
     
     Directive(Atom),     // #[ident]
     Identifier(Atom),    // any sequence of alphanumeric unicode characters or _, starting with alphabetic or underscore
-
-    As,       // as
-    With,     // with
-    In,       // in
-    Is,       // is
-
-    Assert,   // assert
-    Async,    // async
-    Await,    // await
-
-    Class,    // class
-    Struct,   // struct
-
-    Def,      // def
-    Return,   // return
-    Yield,    // yield
-
-    Del,      // del
     
-    If,       // if
-    Elif,     // elif
-    Else,     // else
-    
-    Raise,    // raise
-    Try,      // try
-    Except,   // except
-    Finally,  // finally
-    
-    While,    // while
-    For,      // for
-    Break,    // break
-    Continue, // continue
-    Pass,     // pass
-
-    Import,   // import
-    From,     // from
-    
-    Global,   // global
-    NonLocal, // nonlocal
-    Lambda,   // lambda
-    
-    String(Box<StringLiteral, &'s Bump>), // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
+    String(&'mem StringLiteral), // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
     Number,
-
-    True,                // True
-    False,               // False
-    
-    First,               // First
-    Last,                // Last
     Order(usize),        // any integer followed by order suffix: 1st, 2nd, 3rd...
 
-    Punctuation,         // a sequence of arbitrary unicode punctuation
+    Punctuation(Atom),   // a sequence of arbitrary unicode punctuation
     
     OpenBracket,         // (
     ClosedBracket,       // )
@@ -128,10 +82,6 @@ pub enum TokenValue<'s> {
     Or,                  // "||"
     Not,                 // "!"
     
-    KeywordAnd,          // and
-    KeywordOr,           // or
-    KeywordNot,          // not
-
     BitwiseNot,          // "~"
     BitwiseOrEqual,      // "|="
     BitwiseOr,           // "|"
@@ -179,10 +129,9 @@ pub enum TokenValue<'s> {
 }
 
 #[derive(Debug)]
-pub struct Token<'s> {
-    pub value: TokenValue<'s>,
+pub struct Token<'mem> {
+    pub value: TokenValue<'mem>,
     pub code_location: Range<usize>, // Begin and end bytes
 }
 
-// Index within a BucketArray<Token>
-pub type TokenIndex = NonZeroUsize;
+pub type TokenIndex = NonZeroUsize; // Index within a BucketArray<Token>, non-zero for space optimization within Option<>

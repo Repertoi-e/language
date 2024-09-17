@@ -1,14 +1,15 @@
 use bumpalo::Bump;
+use src_proc_macros::InitKeywords;
+use string_interner::backend::StringBackend;
+use string_interner::StringInterner;
 
 use core::str;
-use std::num::{NonZero, NonZeroUsize};
 use std::panic;
 use std::ops::Range;
 use std::cmp::{max, min};
 
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
-use crate::bucket_array::BucketArray;
 use crate::annotations;
 use crate::tokenizer::token::*;
 
@@ -16,14 +17,59 @@ pub struct SyntaxError {
     pub msg: String,
 }
 
-pub struct Tokenizer<'source, 's, 'c> {
+
+#[allow(non_snake_case)]
+#[derive(InitKeywords)] 
+pub struct Keywords {
+    True: Atom,
+    False: Atom,
+    First: Atom,
+    Last: Atom,
+    and: Atom,
+    or: Atom,
+    not: Atom,
+    r#as: Atom,
+    assert: Atom,
+    r#async: Atom,
+    r#await: Atom,
+    class: Atom,
+    r#struct: Atom,
+    r#continue: Atom,
+    def: Atom,
+    del: Atom,
+    elif: Atom,
+    r#else: Atom,
+    except: Atom,
+    finally: Atom,
+    r#for: Atom,
+    from: Atom,
+    global: Atom,
+    r#if: Atom,
+    import: Atom,
+    r#in: Atom,
+    is: Atom,
+    lambda: Atom,
+    nonlocal: Atom,
+    pass: Atom,
+    r#try: Atom,
+    r#while: Atom,
+    with: Atom,
+    r#yield: Atom,
+}
+
+pub struct ParserContext<'mem> {
+    pub arena: &'mem Bump, 
+    pub string_arena: &'mem mut StringInterner<StringBackend>,
+
+    pub keywords: Keywords,
+}
+
+
+pub struct Tokenizer<'mem, 'c, 'source> {
     pub filename: Option<String>,
     pub source: &'source str,
 
-    pub token_bucket_array: &'c mut BucketArray<'s, Token<'s>>,
-
-    pub arena: &'s Bump,
-    pub string_table: &'s StringTable<'s>,
+    pub context: &'c mut ParserContext<'mem>,
 
     it: usize, // Byte iterator
 }
@@ -55,31 +101,26 @@ impl<'a> Suggestion<'a> {
     }
 }
 
-impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
-    pub fn new(filename: Option<String>, input: &'source str, arena: &'s Bump, string_table: &'s StringTable<'s>, token_bucket_array: &'c mut BucketArray<'s, Token<'s>>) -> Self {
+impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
+    pub fn new(filename: Option<String>, input: &'source str, context: &'c mut ParserContext<'mem>) -> Self {
         Self { 
             filename,
             source: input,
+            context,
             it: 0,
-            arena,
-            string_table,
-            token_bucket_array
         }
     }
 
-    pub fn next_token(&mut self) -> Result<Option<TokenIndex>, SyntaxError> {
+    pub fn next_token(&mut self) -> Result<Option<Token<'mem>>, SyntaxError> {
         let p = self.it;
 
         macro_rules! match_self_peek {
             (
-                $( $byte:literal => $token_value:expr ),* $(,)?                                                          // One-bytes
-                $( ; )+
-                $( ($keyword_byte:literal, $keyword_expr:expr, $keyword_token_value:expr) ),* $(,)?                      // Keywords
-                $( ; $( $custom_pat:pat => $custom_case:block ),+ )+                                                     // Other matches with Some(..)
+                $( $byte:literal => $token_value:expr ),* $(,)?            // One-bytes
+                $( ; $( $custom_pat:pat => $custom_case:block ),+ )+       // Other matches with Some(..)
             ) => {
                 match self.peek() {
                     $( Some($byte) => { Ok(Some(self.eat_byte_and_emit_unchecked($token_value))) } )*
-                    $( Some($keyword_byte) if self.match_sequence($keyword_expr) => { Ok(Some(self.eat_sequence_and_emit_unchecked($keyword_expr, $keyword_token_value))) } )*
                     $( $($custom_pat => { $custom_case })* )*
                     None => Ok(None),
                 }
@@ -99,53 +140,8 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
             b';' => TokenValue::SemiColon,
             b'$' => TokenValue::Dollar,
             b'?' => TokenValue::QuestionMark,
-            b'^' => TokenValue::Hat
-            
-            ;
+            b'^' => TokenValue::Hat;
 
-            (b'T', "True", TokenValue::True),
-            (b'F', "False", TokenValue::False),
-            (b'F', "First", TokenValue::First),
-            (b'L', "Last", TokenValue::Last),
-    
-            (b'a', "and", TokenValue::KeywordAnd),
-            (b'o', "or", TokenValue::KeywordOr),
-            (b'n', "not", TokenValue::KeywordNot),
-    
-            (b'a', "as", TokenValue::As),
-            (b'a', "assert", TokenValue::Assert),
-            (b'a', "async", TokenValue::Async),
-            (b'a', "await", TokenValue::Await),
-    
-            (b'c', "class", TokenValue::Class),
-            (b's', "struct", TokenValue::Struct),
-            (b'c', "continue", TokenValue::Continue),
-            (b'd', "def", TokenValue::Def),
-            (b'd', "del", TokenValue::Del),
-            (b'e', "elif", TokenValue::Elif),
-    
-            (b'e', "else", TokenValue::Else),
-            (b'e', "except", TokenValue::Except),
-            (b'f', "finally", TokenValue::Finally),
-            (b'f', "for", TokenValue::For),
-            (b'f', "from", TokenValue::From),
-            (b'g', "global", TokenValue::Global),
-            (b'i', "if", TokenValue::If),
-    
-            (b'i', "import", TokenValue::Import),
-            (b'i', "in", TokenValue::In),
-            (b'i', "is", TokenValue::Is),
-            (b'l', "lambda", TokenValue::Lambda),
-            (b'n', "nonlocal", TokenValue::NonLocal),
-    
-            (b'p', "pass", TokenValue::Pass),
-            (b't', "try", TokenValue::Try),
-            (b'w', "while", TokenValue::While),
-            (b'w', "with", TokenValue::With),
-            (b'y', "yield", TokenValue::Yield),
-
-            ;
-                        
             Some(b'.') => { 
                 if self.peek_nth_is(1, b'.') {
                     if self.peek_nth_is(2, b'.') {
@@ -309,13 +305,25 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
                 }
             },
 
+            Some(b'#') => { 
+                self.advance(1);
+                if is_ident(self.peek_cp().unwrap_or_default().1, true) {
+                    self.expect_and_eat_ident_range();
+                    let atom = self.atom(&self.source[p..self.it]);
+                    return Ok(Some(self.new_token(TokenValue::Directive(atom), p..self.it)))
+                } else {
+                    Err(self.syntax_err(p..p+1, "expected identifier after # while parsing compiler directive"))
+                }
+            },
+
             Some(b'0'..=b'9') => {
                 Ok(Some(self.expect_and_eat_number()?))
             },
 
             Some(b'\'' | b'"') => {
-                if let Some(string_literal) = self.try_eat_string_literal()? {
-                    Ok(Some(string_literal))
+                let string_literal = self.try_eat_string_literal()?;
+                if string_literal.is_some() {
+                    Ok(string_literal)
                 } else {
                     Err(self.syntax_err(p..p+1, "expected a string literal after quote"))
                 }
@@ -325,26 +333,19 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
                 if let Some(string_literal) = self.try_eat_string_literal()? {
                     Ok(Some(string_literal))
                 } else {
-                    if self.match_sequence("break") {
-                        Ok(Some(self.eat_sequence_and_emit_unchecked("break", TokenValue::Break)))
-                    } else if self.match_sequence("raise") {
-                        Ok(Some(self.eat_sequence_and_emit_unchecked("raise", TokenValue::Raise)))
-                    } else if self.match_sequence("return") {
-                        Ok(Some(self.eat_sequence_and_emit_unchecked("return", TokenValue::Return)))
-                    } else {
-                        Ok(self.try_eat_identifier())
-                    }
+                    Ok(self.expect_and_eat_ident())
                 }
             },
 
-            Some(b'#') => { 
-                self.advance(1);
-                if is_ident(self.peek_cp().unwrap_or_default().1, true) {
-                    self.expect_and_eat_ident();
-                    return Ok(Some(self.new_token(TokenValue::Directive, p..self.it)))
-                } else {
-                    Err(self.syntax_err(p..p+1, "expected identifier after # while parsing compiler directive"))
+            Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => { // ASCII idents shortcut
+                Ok(self.expect_and_eat_ident())
+            },
+
+            Some(b'\t' | b'\x0C' | b'\r' | b' ') => { // ASCII white space shortcut
+                while matches!(self.peek(), Some(b'\t' | b'\x0C' | b'\r' | b' ')) {
+                    self.advance(1);
                 }
+                return Ok(Some(self.new_token(TokenValue::WhiteSpace, p..self.it)));
             },
 
             Some(ch) => {
@@ -366,9 +367,11 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
                     while matches!(self.peek_cp(), Some((_, ch)) if ch.general_category_group() == GeneralCategoryGroup::Punctuation) {
                         self.advance_cp(1);
                     }
-                    return Ok(Some(self.new_token(TokenValue::Punctuation, p..self.it)));
+                    let atom = self.atom(&self.source[p..self.it]);
+                    return Ok(Some(self.new_token(TokenValue::Punctuation(atom), p..self.it)));
                 }
-            
+                
+                // Eat arbitrary unicode identifiers
                 if let Some(identifier) = self.try_eat_identifier() {
                     Ok(Some(identifier))
                 } else {
@@ -379,11 +382,10 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
     }    
 }
 
-impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
+impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
     #[inline]
-    fn new_token(&mut self, value: TokenValue<'s>, range: Range<usize>) -> TokenIndex {
-        // Guaranteed that indices start from 1 so we get the nice NonZero space optimization 
-        NonZero::new(self.token_bucket_array.push_get(Token { value: value, code_location: range }).0).unwrap()
+    fn new_token(&mut self, value: TokenValue<'mem>, range: Range<usize>) -> Token<'mem> {
+        Token { value: value, code_location: range }
     }
 
     #[inline]
@@ -436,19 +438,19 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
     }
 
     // Assumes sequence already matches!
-    fn eat_sequence_and_emit_unchecked(&mut self, sequence: &str, value: TokenValue<'s>) -> TokenIndex {
+    fn eat_sequence_and_emit_unchecked(&mut self, sequence: &str, value: TokenValue<'mem>) -> Token<'mem> {
         let p = self.it;
         self.advance(sequence.len());
         self.new_token(value, p..p+sequence.len())
     }
 
     // Assumes byte already matches!
-    fn eat_byte_and_emit_unchecked(&mut self, value: TokenValue<'s>) -> TokenIndex {
+    fn eat_byte_and_emit_unchecked(&mut self, value: TokenValue<'mem>) -> Token<'mem> {
         self.eat_bytes_and_emit_unchecked(1, value)
     }
 
     // Assumes byte already matches!
-    fn eat_bytes_and_emit_unchecked(&mut self, i: usize, value: TokenValue<'s>) -> TokenIndex {
+    fn eat_bytes_and_emit_unchecked(&mut self, i: usize, value: TokenValue<'mem>) -> Token<'mem> {
         let p = self.it;
         self.advance(i);
         self.new_token(value, p..p+i)
@@ -464,7 +466,7 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
         Ok(p)
     }
 
-    fn eat_multiline_comment(&mut self) -> Result<TokenIndex, SyntaxError> {
+    fn eat_multiline_comment(&mut self) -> Result<Token<'mem>, SyntaxError> {
         let p = self.match_sequence_expect_and_eat("/*")?;
 
         let mut did_recurse = false;
@@ -486,16 +488,10 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
         Ok(self.new_token(TokenValue::Comment, p..self.it))
     }
 
-    fn try_eat_identifier(&mut self) -> Option<TokenIndex> {
-        if is_ident(self.peek_cp().unwrap_or_default().1, true) {
-            let range = self.expect_and_eat_ident();
-            Some(self.new_token(TokenValue::Identifier, range))
-        } else {
-            None
-        }
-    }
-    
-    fn expect_and_eat_ident(&mut self) -> Range<usize> {
+    #[inline]
+    fn atom(&mut self, s: &str) -> Atom { self.context.string_arena.get_or_intern(s) }
+
+    fn expect_and_eat_ident_range(&mut self) -> Range<usize> {
         let p = self.it;
         while self.peek_cp().take_if(|(_, x)| is_ident(*x, false)).is_some() {
             self.next();
@@ -503,7 +499,21 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
         p..self.it
     }
 
-    fn expect_and_eat_number(&mut self) -> Result<TokenIndex, SyntaxError> {
+    fn expect_and_eat_ident(&mut self) -> Option<Token<'mem>> {
+        let range = self.expect_and_eat_ident_range();
+        let atom = self.atom(&self.source[range.clone()]);
+        Some(self.new_token(TokenValue::Identifier(atom), range))
+    }
+
+    fn try_eat_identifier(&mut self) -> Option<Token<'mem>> {
+        if is_ident(self.peek_cp().unwrap_or_default().1, true) {
+            self.expect_and_eat_ident()
+        } else {
+            None
+        }
+    }
+
+    fn expect_and_eat_number(&mut self) -> Result<Token<'mem>, SyntaxError> {
         let first = self.peek().take_if(|x| x.is_ascii_digit() || *x == b'.').unwrap_or_default();
         
         if first == 0 {
@@ -538,7 +548,7 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
         Ok(self.new_token(TokenValue::Number, begin_number..end_number))
     }
     
-    fn try_eat_string_literal(&mut self) -> Result<Option<TokenIndex>, SyntaxError> {
+    fn try_eat_string_literal(&mut self) -> Result<Option<Token<'mem>>, SyntaxError> {
         if let Some(ch) = self.peek() {
             let begin_p = self.it;
 
@@ -558,7 +568,7 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
             }
 
             // Parse a number of hashes for a raw string, to build the expected terminating sequence.
-            let mut parse_until_vec = Vec::<u8, _>::new_in(&self.arena); // Since we're allocating in the arena the string can grow without copying
+            let mut parse_until_vec = Vec::<u8, _>::new_in(self.context.arena); // Since we're allocating in the arena the string can grow without copying
             if is_raw {
                 while self.peek_nth_is(begin_offset,  b'#') {
                     parse_until_vec.push(b'#');
@@ -606,7 +616,7 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
             // so it can be checked if it already exists in the string table. If we just push strings the string table 
             // arena and do deduplication later, then at that time we'd have to drop and copy all the non-repeating ones anyway.
             // In any case a copy has to happen. 
-            let mut content = Vec::<u8, _>::new_in(&self.arena); // Since we're allocating in the arena the string can grow without copying
+            let mut content = Vec::<u8, _>::new_in(self.context.arena); // Since we're allocating in the arena the string can grow without copying
 
             while !self.match_sequence(&parse_until) {
                 match self.next() {
@@ -733,21 +743,19 @@ impl<'source, 's, 'c> Tokenizer<'source, 's, 'c> {
 
             let mut suffix = None;
             if matches!(self.peek_cp(), Some((_, c)) if is_ident(c, true)) {
-                suffix = Some(self.expect_and_eat_ident());
+                let range = self.expect_and_eat_ident_range();
+                suffix = Some(self.atom(&self.source[range]))
             }
 
-            return Ok(Some(self.new_token(TokenValue::String(Box::new_in(StringLiteral {
-                is_raw: is_raw,
-                is_byte: is_byte,
+            let atom = self.atom(unsafe { str::from_utf8_unchecked(&content) });
+            let literal = self.context.arena.alloc(StringLiteral {
+                is_byte_string: is_byte,
                 begin: begin_p..begin_p+begin_offset,
                 end: end_p..end_p+&parse_until.len(),
-                content: if is_byte {
-                    StringLiteralValue::Bytes(self.string_table.get_bytes_or_insert(&content))
-                } else {
-                    StringLiteralValue::String(self.string_table.get_string_or_insert(&content))
-                },
+                content: atom,
                 suffix: suffix,
-            }, self.arena)), begin_p..self.it)));
+            });
+            return Ok(Some(self.new_token(TokenValue::String(literal), begin_p..self.it)));
         } else {
             Ok(None)
         }

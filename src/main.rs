@@ -1,7 +1,6 @@
 #![feature(allocator_api)]
 
 use anstyle::{AnsiColor, Reset, RgbColor};
-use bucket_array::BucketArray;
 use bumpalo::Bump;
 use clap::Parser;
 
@@ -11,7 +10,6 @@ use rustyline::DefaultEditor;
 use string_interner::StringInterner;
 
 use core::str;
-use std::collections::HashSet;
 use std::fs;
 
 mod annotations;
@@ -34,39 +32,50 @@ struct Args {
     run: String,
 }
 
-fn tokenize<'source, 's, 'c>(tokenizer: &mut Tokenizer<'source, 's, 'c>) -> Result<usize, SyntaxError> {
+const DEBUG_TOKENS: bool = false;
+
+fn tokenize<'source, 'c, 'd>(tokenizer: &mut Tokenizer<'source, 'c, 'd>) -> Result<usize, SyntaxError> {
+    let mut tokens = Vec::<Token>::new();
+
     let mut token_count = 0usize;
-    while let Some(_) = tokenizer.next_token()? {
-        // println!("{}:    {:?}", tokens.len() + 1, tokenizer.token_bucket_array.get(token).expect(format!("internal error; couldn't get token at index: {}", token).as_str()));
-        token_count += 1;
-        // tokens.push(token);
-    }
-    println!("Count: {}", token_count);
-    /* 
-    let colors = vec![RgbColor(237, 174, 73), RgbColor(209, 73, 91), RgbColor(0, 121, 140), RgbColor(202, 255, 208)];
-
-    let mut color = 0;
-    for t_index in &tokens {
-        color = (color + 1) % colors.len();
-
-        let c = colors[color];
-
-        let t = tokenizer.token_bucket_array.get(*t_index).expect(format!("internal error; couldn't get token at index: {}", t_index).as_str());
-
-        let s = &tokenizer.source[t.code_location.clone()];
-        if s.find('\n').is_some() {
-            let lines: Vec<_> = s.split('\n').collect();
-            for (it, line) in enumerate(&lines) {
-                anstream::print!("{}{}{}{}", c.render_bg(), AnsiColor::Black.render_fg(), line, Reset.render());
-                if it < lines.len() - 1 {
-                    anstream::println!();
-                }
+    while let Some(token) = tokenizer.next_token()? {
+        if DEBUG_TOKENS {
+            println!("{}:    {:?}", tokens.len() + 1, token);
+            match token.value {
+                TokenValue::Identifier(atom) => println!("Ident: {}", tokenizer.context.string_arena.resolve(atom).unwrap_or_default()),
+                _ => {}
             }
-        } else {
-            anstream::print!("{}{}{}{}", c.render_bg(), AnsiColor::Black.render_fg(), s, Reset.render());
+            tokens.push(token);
         }
+        token_count += 1;
     }
-    anstream::println!("{}", Reset.render());*/
+    
+    println!("Count: {}", token_count);
+
+    if DEBUG_TOKENS {
+        let colors = vec![RgbColor(237, 174, 73), RgbColor(209, 73, 91), RgbColor(0, 121, 140), RgbColor(202, 255, 208)];
+
+        let mut color = 0;
+        for t in &tokens {
+            color = (color + 1) % colors.len();
+
+            let c = colors[color];
+
+            let s = &tokenizer.source[t.code_location.clone()];
+            if s.find('\n').is_some() {
+                let lines: Vec<_> = s.split('\n').collect();
+                for (it, line) in enumerate(&lines) {
+                    anstream::print!("{}{}{}{}", c.render_bg(), AnsiColor::Black.render_fg(), line, Reset.render());
+                    if it < lines.len() - 1 {
+                        anstream::println!();
+                    }
+                }
+            } else {
+                anstream::print!("{}{}{}{}", c.render_bg(), AnsiColor::Black.render_fg(), s, Reset.render());
+            }
+        }
+        anstream::println!("{}", Reset.render());
+    }
     return Ok(token_count);
 }
 
@@ -103,24 +112,24 @@ fn main() {
 
     std::env::set_var("RUST_BACKTRACE", "full");
 
-    let string_interner = StringInterner::default();
-    let st = string_interner.get_or_intern_static("");
-    let str: &str = st;
+    let mut string_arena = StringInterner::default();
 
-    let token_arena = Bump::new();
-    let mut token_bucket_array = BucketArray::new_in(&token_arena);
+    let parser_arena = Bump::new();
     
-    // Insert dummy token to guarantee bucket indices of actual tokens start from 1. 
-    // We do this because TokenIndex is a NonZero which has nice space optimizations for Option<TokenIndex>
-    token_bucket_array.push(Token {value: TokenValue::WhiteSpace, code_location: 0..0}); 
+    let keywords = Keywords::new(&mut string_arena);
+    let mut parser_context = ParserContext {
+        arena: &parser_arena,
+        string_arena: &mut string_arena,
+        keywords
+    };
 
     if !args.add.is_empty() {
-        let mut tokenizer = Tokenizer::new(Some("<--add>".to_string()), &args.add, &token_arena, &string_table, &mut token_bucket_array);
+        let mut tokenizer = Tokenizer::new(Some("<--add>".to_string()), &args.add, &mut parser_context);
         if let Err(e) = tokenize(&mut tokenizer) { anstream::println!("{}", e.msg); return; }
     }
     
     if !args.run.is_empty() {
-        let mut tokenizer = Tokenizer::new(Some("<--run>".to_string()), &args.run, &token_arena, &string_table, &mut token_bucket_array);
+        let mut tokenizer = Tokenizer::new(Some("<--run>".to_string()), &args.run, &mut parser_context);
         if let Err(e) = tokenize(&mut tokenizer) { anstream::println!("{}", e.msg); return; }
         return;
     }
@@ -130,7 +139,7 @@ fn main() {
             Ok(mut contents) => {
                 contents = contents.trim_start_matches("\u{feff}").to_string().replace("\r\n", "\n"); // Handle BOM and Windows newlines
                 
-                let mut tokenizer = Tokenizer::new(Some(file), &contents, &token_arena, &string_table, &mut token_bucket_array);
+                let mut tokenizer = Tokenizer::new(Some(file), &contents, &mut parser_context);
                 if let Err(e) = tokenize(&mut tokenizer) { anstream::println!("{}", e.msg); return; }
             }
             Err(err) => {
@@ -173,7 +182,7 @@ fn main() {
 
                 input = input.replace("\r\n", "\n"); // Handle Windows newlines
 
-                let mut tokenizer = Tokenizer::new(None, &input, &token_arena, &string_table, &mut token_bucket_array);
+                let mut tokenizer = Tokenizer::new(None, &input, &mut parser_context);
                 if let Err(e) = tokenize(&mut tokenizer) { anstream::println!("{}", e.msg); continue; }
             },
             Err(ReadlineError::Interrupted) => { break },

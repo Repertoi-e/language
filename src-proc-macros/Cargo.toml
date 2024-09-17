@@ -1,0 +1,12 @@
+[package]
+name = "src-proc-macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+string-interner = { path = "../string-interner", features = ["inline-more"] }
+quote = "1.0"
+syn = "1.0.107"

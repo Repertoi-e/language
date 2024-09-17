@@ -1,5 +1,7 @@
 use std::vec;
 
+use bumpalo::Bump;
+
 use super::{Bucket, BucketArray};
 
 #[derive(Debug, Clone)]
@@ -139,16 +141,16 @@ impl<'bump, T> DoubleEndedIterator for IterMut<'bump, T> {
 
 #[derive(Debug)]
 pub struct IntoIter<'bump, T> {
-    buckets: vec::IntoIter<Bucket<'bump, T>>, // Buckets iterator used by forward iteration.
-    front_iter: Option<vec::IntoIter<T>>, // Front iterator for `next`.
-    back_iter: Option<vec::IntoIter<T>>, // Back iterator for `next_back`.
+    buckets: vec::IntoIter<Bucket<'bump, T>, &'bump Bump>, // Buckets iterator used by forward iteration.
+    front_iter: Option<vec::IntoIter<T, &'bump Bump>>, // Front iterator for `next`.
+    back_iter: Option<vec::IntoIter<T, &'bump Bump>>, // Back iterator for `next_back`.
     
     // Number of elements that are to be yielded by the iterator.
     len: usize,
 }
 
 impl<'bump, T> IntoIter<'bump, T> {
-    pub(crate) fn new(arr: BucketArray<T>) -> Self {
+    pub(crate) fn new(arr: BucketArray<'bump, T>) -> Self {
         let len = arr.len;
         Self {
             buckets: arr.buckets.into_iter(),
