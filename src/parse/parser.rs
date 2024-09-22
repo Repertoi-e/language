@@ -1,19 +1,18 @@
 use std::{ops::Range, sync::atomic::{AtomicUsize, Ordering}};
 
-use bumpalo::Bump;
-
-use super::{ast::{Ast, AstKind, ConstantValue, NameContext}, AstOption, AstVec, Context, NumericLiteral, StringLiteral, Strings, SyntaxErr, Token, TokenValue, Tokenizer};
-use crate::annotations::Level;
+use super::{ast::{Ast, AstKind, ConstantValue, NameContext}, AstOption, AstRef, AstVec, NumericLiteral, StringLiteral, Strings, SyntaxErr, Token, TokenValue, Tokenizer, TokensVec};
+use crate::{annotations::Level, ArenaRef, AST_ARENA, AST_ARENA_HERD, KEYWORDS, PARSER_ARENA, PARSER_ARENA_HERD};
 
 static AST_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub struct Parser<'mem, 'c, 'source> {
-    pub context: &'c mut Context<'mem>,
-
+pub struct Parser<'source> {
     filename: Option<String>,
     source: &'source str,
 
-    tokens: Vec<Token, &'mem Bump>, // Collected from tokenizer
+    parser_arena: ArenaRef,
+    ast_arena: ArenaRef,
+
+    tokens: TokensVec, // Collected from tokenizer
     it: usize, // Token iterator
 
     inside_brackets: bool, // True while parsing brackets, so we count new line characters as white space 
@@ -98,16 +97,14 @@ macro_rules! peek_and_eat_if_next_match {
     }}
 }
 
-impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
-    pub fn new(filename: Option<String>, input: &'source str, context: &'c mut Context<'mem>) -> Result<Self, SyntaxErr<'source>> {
-        let tokenizer = Tokenizer::new(filename.clone(), input, context);
-        let tokens = tokenizer.collect()?;
-
+impl<'source> Parser<'source> {
+    pub fn new(filename: Option<String>, input: &'source str) -> Result<Self, SyntaxErr<'source>> {
         Ok(Self {
-            context: context,
+            tokens: Tokenizer::new(filename.clone(), input).collect()?,
             filename,
             source: input,
-            tokens: tokens,
+            parser_arena: PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get()),
+            ast_arena: AST_ARENA.get_or(|| AST_ARENA_HERD.get()),
             it: 0,
             inside_brackets: false,
         })
@@ -116,10 +113,10 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
     // 
     // A program is a series of statements 
     // 
-    pub fn parse(&mut self) -> Result<Option<&'mem Ast<'mem>>, SyntaxErr<'source>> {
+    pub fn parse(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let p = self.it;
 
-        let mut statements: Vec<&Ast<'mem>, &Bump> = Vec::new_in(self.context.arena); // @TODO @Speed This will get moved around cuz it's not gonna be continous because of allocations happening in the loop
+        let mut statements: Vec<AstRef, _> = Vec::new_in(self.parser_arena);
 
         while let Some(statement) = self.parse_statement()? { 
             let next = self.peek_token();
@@ -150,16 +147,16 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
     }
 }
 
-impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
-    fn new_ast(&mut self, kind: AstKind<'mem>, token_range: Range<usize>) -> &'mem mut Ast<'mem> {
-        self.context.arena.alloc(Ast {
+impl<'source> Parser<'source> {
+    fn new_ast(&mut self, kind: AstKind, token_range: Range<usize>) -> AstRef {
+        self.ast_arena.alloc(Ast {
             id: AST_ID.fetch_add(1, Ordering::Relaxed),
             token_range,
             kind,
         })
     }
 
-    fn parse_statement(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_statement(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         if let Some(t) = self.peek_token() {
             if t.loc.leading_whitespace != 0 {
                 return Err(self.syntax_err()
@@ -184,7 +181,7 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
         }
     }
 
-    fn parse_expression(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_expression(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let p = self.it;
 
         if let Some(t) = peek_and_eat_if_next_match!(self, 0 => TokenValue::Identifier(_)) {
@@ -203,12 +200,12 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
         Ok(None)
     }
 
-    fn parse_strings(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_strings(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         // Consecutive strings get appended to each other
         
         let p = self.it;
 
-        let mut strings = Vec::<StringLiteral, _>::new_in(self.context.arena); // @TODO @Speed This will get moved around cuz it's not gonna be continous because of allocations happening in the loop
+        let mut strings = Vec::<StringLiteral, _>::new_in(self.parser_arena);
         while let Some(next) = self.peek_token() {
             if !matches!(next.value, TokenValue::String(_)) {
                 break;
@@ -225,15 +222,15 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
     }
 
     fn reparse_string_literal(&mut self, t: &Token) -> StringLiteral {
-        let mut tokenizer = Tokenizer::new(None, &self.source[t.loc.range.clone()], self.context);
+        let mut tokenizer = Tokenizer::new(None, &self.source[t.loc.range.clone()]);
         let string_literal = tokenizer.parse_string_literal().expect("internal error; re-parsing string literal in parser was not succesful");
         string_literal.expect("internal error; re-parsed string literal was None")
     }
 
-    fn reparse_numeric_literal(&mut self, t: &Token) -> &'mem NumericLiteral {
-        let mut tokenizer = Tokenizer::new(None, &self.source[t.loc.range.clone()], self.context);
+    fn reparse_numeric_literal(&mut self, t: &Token) -> NumericLiteral {
+        let mut tokenizer = Tokenizer::new(None, &self.source[t.loc.range.clone()]);
         let numeric_literal = tokenizer.parse_numeric_literal().expect("internal error; re-parsing numeric literal in parser was not succesful");
-        self.context.arena.alloc(numeric_literal)
+        numeric_literal
     }
 
     /*
@@ -253,7 +250,7 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
     | '...' 
     */
 
-    fn parse_atom(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_atom(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let p = self.it;
         
         if let Some(t) = peek_and_eat_if_next_match!(self, 0 => TokenValue::Number) {
@@ -270,11 +267,11 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
 
         if let Some(t) = peek_and_eat_if_next_match!(self, 0 => TokenValue::Keyword(_)) {
             if let TokenValue::Keyword(keyword) = t.value {
-                if keyword == self.context.keywords.True {
+                if keyword == KEYWORDS.True {
                     return Ok(Some(self.new_ast(AstKind::Constant { value: ConstantValue::Bool(true) }, p..p+1)))
-                } else if keyword == self.context.keywords.False { 
+                } else if keyword == KEYWORDS.False { 
                     return Ok(Some(self.new_ast(AstKind::Constant { value: ConstantValue::Bool(false) }, p..p+1)))
-                } else if keyword == self.context.keywords.None {
+                } else if keyword == KEYWORDS.None {
                     return Ok(Some(self.new_ast(AstKind::Constant { value: ConstantValue::None }, p..p+1)))
                 } else {
                     self.it = p;
@@ -290,7 +287,7 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
         Ok(None)
     }
 
-    fn parse_single_subscript_attribute_target(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_single_subscript_attribute_target(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let mut ast;
         if let Some(atom) = self.parse_atom()? {  // Start with an atom
             ast = atom;
@@ -328,7 +325,7 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
         range(start, end)
     }
 
-    fn parse_single_target(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_single_target(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let p = self.it;
 
         if let Some(target) = self.parse_single_subscript_attribute_target()? {
@@ -368,12 +365,12 @@ impl<'mem, 'c, 'source> Parser<'mem, 'c, 'source> {
         }
     }
     
-    fn parse_annotated_rhs(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_annotated_rhs(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         // yield_expr or star_expressions
         self.parse_expression()
     }
 
-    fn parse_assignment(&mut self) -> Result<Option<&'mem mut Ast<'mem>>, SyntaxErr<'source>> {
+    fn parse_assignment(&mut self) -> Result<Option<AstRef>, SyntaxErr<'source>> {
         let p = self.it;
 
         // NAME ':' expression ['=' annotated_rhs ] 

@@ -1,6 +1,6 @@
-use std::{fmt::{write, Display}, mem, ops::Range};
+use std::{fmt::Display, ops::Range};
 
-use bumpalo::Bump;
+use bumpalo::BumpSync;
 use display_tree::DisplayTree;
 use itertools::enumerate;
 
@@ -8,15 +8,15 @@ use crate::STRING_ARENA;
 
 use super::{Atom, NumericLiteral, StringLiteral};
 
-pub struct Strings<'mem>(pub Vec<StringLiteral, &'mem Bump>);
+pub struct Strings(pub Vec<StringLiteral, &'static BumpSync<'static>>);
 
 impl Display for StringLiteral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{:?}", STRING_ARENA.lock().unwrap().resolve(self.content))
+        write!(f, "{:?}", STRING_ARENA.lock().unwrap().resolve(self.content).unwrap())
     }
 }
 
-impl<'mem> Display for Strings<'mem> {
+impl Display for Strings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[")?;
         for (it, el) in enumerate(&self.0) {
@@ -29,14 +29,14 @@ impl<'mem> Display for Strings<'mem> {
     }
 }
 
-pub enum ConstantValue<'mem> {
-    String(Strings<'mem>),
-    Number(&'mem NumericLiteral),
+pub enum ConstantValue {
+    String(Strings),
+    Number(NumericLiteral),
     Bool(bool),
     None,
 }
 
-impl<'mem> Display for ConstantValue<'mem> {
+impl Display for ConstantValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::String(strings) => write!(f, "{}", strings),
@@ -104,24 +104,24 @@ impl Display for NameContext {
     }
 }
 
-pub struct AstVec<'mem>(pub Vec<&'mem Ast<'mem>, &'mem Bump>);
+pub struct AstVec(pub Vec<AstRef, &'static BumpSync<'static>>);
 
-pub struct AstOption<'mem>(pub Option<&'mem Ast<'mem>>);
+pub struct AstOption(pub Option<AstRef>);
 
-impl<'mem> DisplayTree for AstOption<'mem> {
+impl DisplayTree for AstOption {
     fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
-        if let Some(el) = self.0 {
+        if let Some(el) = &self.0 {
             DisplayTree::fmt(el, f, style)?;
         }
         std::fmt::Result::Ok(())
     }
 }
 
-impl<'mem> DisplayTree for AstVec<'mem> {
+impl DisplayTree for AstVec {
     fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
         for (it, el) in enumerate(&self.0) {
             write!(f, "[{}] ", it)?;
-            DisplayTree::fmt(*el, f, style)?;
+            DisplayTree::fmt(el, f, style)?;
             if it != self.0.len() - 1 {
                 writeln!(f, "")?
             }
@@ -132,11 +132,11 @@ impl<'mem> DisplayTree for AstVec<'mem> {
 
 #[derive(DisplayTree)]
 
-pub enum AstKind<'mem> {
+pub enum AstKind {
     Module { 
         // List of statements
         #[tree]
-        body: AstVec<'mem>,
+        body: AstVec,
     },
 
     Name {
@@ -146,81 +146,82 @@ pub enum AstKind<'mem> {
 
     Assign {
         #[tree]
-        targets: AstVec<'mem>,
+        targets: AstVec,
         #[tree]
-        value: &'mem Ast<'mem>,
+        value: AstRef,
     },
 
     AnnAssign {
         #[tree]
-        target: &'mem Ast<'mem>,
+        target: AstRef,
 
         #[tree]
-        annotation: &'mem Ast<'mem>,
+        annotation: AstRef,
 
         #[tree]
-        value: AstOption<'mem>,
+        value: AstOption,
     },
 
     AugAssign {
         #[tree]
-        target: &'mem Ast<'mem>,
+        target: AstRef,
         #[node_label]
         op: BinOp,
         #[tree]
-        value: &'mem Ast<'mem>,
+        value: AstRef,
     },
     
     BinOp {
         #[tree]
-        left: &'mem Ast<'mem>,
+        left: AstRef,
         #[node_label]
         op: BinOp,
         #[tree]
-        right: &'mem Ast<'mem>,
+        right: AstRef,
     },
 
     UnaryOp {
         op: BinOp,
         #[tree]
-        operand: &'mem Ast<'mem>,
+        operand: AstRef,
     },
 
     Constant {
-        value: ConstantValue<'mem>
+        value: ConstantValue
     },
 
     // Only when an expression, such as a function call, appears as a statement by itself with its return value not used or stored.
     Expression {
         #[tree]
-        value: &'mem Ast<'mem>,
+        value: AstRef,
     },
 
     Attribute {
         #[tree]
-        value: &'mem Ast<'mem>,
+        value: AstRef,
 
         attribute: Atom,
     },
 
     Walrus {
         #[tree]
-        target: &'mem Ast<'mem>,
+        target: AstRef,
 
         #[tree]
-        value: &'mem Ast<'mem>,
+        value: AstRef,
     },
 }
 
-
-pub struct Ast<'mem> {
+pub struct Ast {
     pub id: usize,
     pub token_range: Range<usize>, // start..end span into the token array of collected tokens from the tokenizer
     
-    pub kind: AstKind<'mem>,
+    pub kind: AstKind,
 }
 
-impl<'mem> DisplayTree for Ast<'mem> {
+pub type AstRef = &'static mut Ast;
+
+impl DisplayTree for AstRef {
     fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
         DisplayTree::fmt(&self.kind, f, style)
     }

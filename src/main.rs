@@ -1,8 +1,8 @@
 #![feature(allocator_api)]
-#[allow(dead_code)]
 
 use anstyle::{AnsiColor, Reset, RgbColor};
-use bumpalo::Bump;
+use bumpalo::BumpSync;
+use bumpalo::Herd;
 
 use clap::Parser;
 
@@ -12,10 +12,11 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use string_interner::backend::StringBackend;
 use string_interner::StringInterner;
+use thread_local::ThreadLocal;
 
 use core::str;
 use std::fs;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 mod annotations;
 
@@ -39,15 +40,15 @@ struct Args {
 
 const DEBUG_TOKENS: bool = false;
 
-fn tokenize<'source>(filename: Option<String>, source: &'source str, mut context: &mut Context) -> Result<usize, SyntaxErr<'source>> {
-    let tokenizer = Tokenizer::new(filename, source, &mut context);
+fn tokenize<'source>(filename: Option<String>, source: &'source str) -> Result<usize, SyntaxErr<'source>> {
+    let tokenizer = Tokenizer::new(filename, source);
     let tokens = tokenizer.collect()?;
 
     if DEBUG_TOKENS {
         for t in &tokens {
             println!("{}:    {:?}", tokens.len() + 1, t);
             match t.value {
-                TokenValue::Identifier(atom) => println!("Ident: {}", context.string_arena.resolve(atom).unwrap_or_default()),
+                TokenValue::Identifier(atom) => println!("Ident: {}", STRING_ARENA.lock().unwrap().resolve(atom).unwrap()),
                 _ => {}
             }
         }
@@ -82,40 +83,42 @@ fn tokenize<'source>(filename: Option<String>, source: &'source str, mut context
 }
 
 
-fn parse<'source, 'mem>(filename: Option<String>, source: &'source str, context: &mut Context<'mem>) -> Result<Option<&'mem Ast<'mem>>, SyntaxErr<'source>> {
-    let mut parser = crate::parse::Parser::new(filename, source, context)?;
-    let ast: Option<&'mem Ast<'mem>> = parser.parse()?;
+fn parse<'source, 'mem>(filename: Option<String>, source: &'source str) -> Result<Option<AstRef>, SyntaxErr<'source>> {
+    let mut parser = crate::parse::Parser::new(filename, source)?;
+    let ast = parser.parse()?;
 
-    if let Some(some_ast) = ast {
-        println_tree!(*some_ast);
+    if let Some(tree) = &ast {
+        println_tree!(*tree);
     }
 
     Ok(ast)
 }
+use lazy_static::lazy_static;
 
-static STRING_ARENA: LazyLock<Mutex<StringInterner<StringBackend>>> = LazyLock::new(|| Mutex::new(StringInterner::default()));
+pub type ArenaRef = &'static BumpSync<'static>;
+
+lazy_static! {
+    static ref STRING_ARENA: Mutex<StringInterner<StringBackend>> = Mutex::new(StringInterner::default());
+    static ref KEYWORDS: Keywords = Keywords::new(&mut STRING_ARENA.lock().unwrap());
+
+    static ref PARSER_ARENA_HERD: Herd = Herd::new();
+    static ref PARSER_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
+
+    static ref AST_ARENA_HERD: Herd = Herd::new();
+    static ref AST_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
+}
 
 fn main() {
     let args = Args::parse();
 
     std::env::set_var("RUST_BACKTRACE", "full");
 
-    let parser_arena = Bump::new();
-
-    let keywords = Keywords::new(&mut STRING_ARENA.lock().unwrap());
-    
-    let mut context = Context {
-        arena: &parser_arena,
-        string_arena: &mut STRING_ARENA.lock().unwrap(),
-        keywords
-    };
-
     if !args.add.is_empty() {
-        if let Err(e) = parse(Some("<--add>".to_string()), &args.add, &mut context) { anstream::println!("{}", e); return; }
+        if let Err(e) = parse(Some("<--add>".to_string()), &args.add) { anstream::println!("{}", e); return; }
     }
     
     if !args.run.is_empty() {
-        if let Err(e) = parse(Some("<--run>".to_string()), &args.run, &mut context) { anstream::println!("{}", e); return; }
+        if let Err(e) = parse(Some("<--run>".to_string()), &args.run) { anstream::println!("{}", e); return; }
         return;
     }
 
@@ -123,7 +126,7 @@ fn main() {
         match fs::read_to_string(&file) {
             Ok(mut contents) => {
                 contents = contents.trim_start_matches("\u{feff}").to_string().replace("\r\n", "\n"); // Handle BOM and Windows newlines
-                if let Err(e) = parse(Some(file), &contents, &mut context) { anstream::println!("{}", e); return; }
+                if let Err(e) = parse(Some(file), &contents) { anstream::println!("{}", e); return; }
             }
             Err(err) => {
                 println!("{}: {}", &file, err);
@@ -153,7 +156,7 @@ fn main() {
                     continue;
                 }
 
-                if let Err(e) = parse(None, &input, &mut context) { 
+                if let Err(e) = parse(None, &input) { 
                     if e.in_interactive_interpreter_should_discard_and_instead_read_more_lines {
                         input.push('\n');
 

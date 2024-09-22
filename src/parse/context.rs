@@ -45,8 +45,6 @@ pub struct Keywords {
 
 pub struct Context<'mem> {
     pub arena: &'mem Bump, 
-    pub string_arena: &'mem mut StringInterner<StringBackend>,
-
     pub keywords: Keywords,
 }
 

@@ -2,42 +2,45 @@ use core::str;
 use std::panic;
 use std::ops::Range;
 
-use bumpalo::Bump;
+use bumpalo::BumpSync;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::annotations::Level;
-use crate::parse::context::Context;
 use crate::parse::syntax_err::SyntaxErr;
 use crate::parse::token::*;
+use crate::{ArenaRef, KEYWORDS, PARSER_ARENA, PARSER_ARENA_HERD, STRING_ARENA};
 
-pub struct Tokenizer<'mem, 'c, 'source> {
+pub type TokensVec = Vec<Token, &'static BumpSync<'static>>;
+
+
+pub struct Tokenizer<'source> {
     pub filename: Option<String>,
     pub source: &'source str,
 
-    pub context: &'c mut Context<'mem>,
-
     it: usize, // Byte iterator
 
-    tokens: Vec<Token, &'mem Bump>,
+    token_arena: ArenaRef,
+    tokens: TokensVec,
 
     leading_whitespace: usize // Gets consumed into the next non white space token 
 }
 
-impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
-    pub fn new(filename: Option<String>, input: &'source str, context: &'c mut Context<'mem>) -> Self {
+impl<'source> Tokenizer<'source> {
+    pub fn new(filename: Option<String>, input: &'source str) -> Self {
         let approximate_token_count: usize = ((input.len() / 3) as f64 * 0.6) as usize; // Assume 30% empty space and 3 bytes per token as nice estimate
 
+        let token_arena = PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get());
         Self { 
             filename,
             source: input,
-            tokens: Vec::with_capacity_in(approximate_token_count, context.arena),
-            context,
             it: 0,
+            tokens: Vec::with_capacity_in(approximate_token_count, token_arena),
+            token_arena, 
             leading_whitespace: 0
         }
     }
 
-    pub fn collect(mut self) -> Result<Vec<Token, &'mem Bump>, SyntaxErr<'source>> {
+    pub fn collect(mut self) -> Result<TokensVec, SyntaxErr<'source>> {
         while let Some(_) = self.next_token()? {}
         Ok(self.tokens)
     }
@@ -62,7 +65,7 @@ impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
             }
 
             // Parse a number of hashes for a raw string, to build the expected terminating sequence.
-            let mut parse_until_vec = Vec::<u8, _>::new_in(self.context.arena); // Since we're allocating in the arena the string can grow without copying
+            let mut parse_until_vec = Vec::<u8, _>::new_in(self.token_arena); // Since we're allocating in the arena the string can grow without copying
             if is_raw {
                 while self.peek_nth_is(begin_offset,  b'#') {
                     parse_until_vec.push(b'#');
@@ -110,7 +113,7 @@ impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
             // so it can be checked if it already exists in the string table. If we just push strings the string table 
             // arena and do deduplication later, then at that time we'd have to drop and copy all the non-repeating ones anyway.
             // In any case a copy has to happen. 
-            let mut content = Vec::<u8, _>::new_in(self.context.arena); // Since we're allocating in the arena the string can grow without copying
+            let mut content = Vec::<u8, _>::new_in(self.token_arena); // Since we're allocating in the arena the string can grow without copying
 
             while !self.match_sequence(&parse_until) {
                 match self.next() {
@@ -738,7 +741,7 @@ impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
 
 }
 
-impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
+impl<'source> Tokenizer<'source> {
     #[inline]
     fn new_token(&mut self, value: TokenValue, range: Range<usize>) -> usize {
         let trailing_whitespace = self.eat_white_space();
@@ -865,7 +868,7 @@ impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
     }
 
     #[inline]
-    fn atom(&mut self, s: &str) -> Atom { self.context.string_arena.get_or_intern(s) }
+    fn atom(&mut self, s: &str) -> Atom { STRING_ARENA.lock().unwrap().get_or_intern(s) }
 
     fn expect_and_eat_ident_range(&mut self) -> Range<usize> {
         let p = self.it;
@@ -878,7 +881,7 @@ impl<'mem, 'c, 'source> Tokenizer<'mem, 'c, 'source> {
     fn expect_and_eat_ident(&mut self) -> usize {
         let range = self.expect_and_eat_ident_range();
         let atom = self.atom(&self.source[range.clone()]);
-        self.new_token(if self.context.keywords.is_keyword(atom) {
+        self.new_token(if KEYWORDS.is_keyword(atom) {
             TokenValue::Keyword(atom)
         } else {
             TokenValue::Identifier(atom)

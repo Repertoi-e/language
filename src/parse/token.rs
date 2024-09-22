@@ -101,7 +101,6 @@ pub enum TokenValue {
 
     String(Atom),        // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
     Number,
-    Order,
 
     Punctuation(Atom),   // a sequence of arbitrary unicode punctuation
     
