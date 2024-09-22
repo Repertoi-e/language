@@ -1,8 +1,6 @@
 "Some random string!"
 
 
-
-
            Some(b'T') if self.match_sequence("True") => Some(self.new_token_and_advance(TokenValue::True, p..p+4)),
             Some(b'F') if self.match_sequence("False") => Some(self.new_token_and_advance(TokenValue::False, p..p+5)),
             Some(b'F') if self.match_sequence("First") => Some(self.new_token_and_advance(TokenValue::First, p..p+5)),

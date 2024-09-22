@@ -28,3 +28,4 @@ unicode-width = "0.1.11"
 
 fixed = "1.28.0"
 num-bigint = "0.4.6"
+display_tree = "1.1.2"

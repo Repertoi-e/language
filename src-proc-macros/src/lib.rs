@@ -29,6 +29,11 @@ pub fn derive_init_keywords(input: TokenStream) -> TokenStream {
                     #( #fields_as_idents : string_arena.get_or_intern_static(#fields_as_strings), )*
                 }
             }
+
+            pub fn is_keyword(&self, atom: Atom) -> bool {
+                #( if self.#fields_as_idents == atom { return true; } )*
+                false
+            }
         }
     };
 
