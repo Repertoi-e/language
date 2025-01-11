@@ -1,33 +1,94 @@
-use std::ops::Range;
+use std::{fmt::Display, ops::Range};
 
+use display_tree::DisplayTree;
 use string_interner::symbol::SymbolU32;
 
-pub type Atom = SymbolU32;
+use crate::STRING_ARENA;
 
-pub enum IntegerValue {
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    I128(i128),
-    // IBig(BigInt),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    U128(u128),
-    // UBig(BigUint),
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Atom(pub SymbolU32);
+
+impl Display for Atom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.value)
+    }
 }
 
-pub struct Integer {
-    size_in_bits: i8,
-    signed: bool,
-    value: IntegerValue
+impl DisplayTree for Atom {
+    fn fmt(&self, f: &mut std::fmt::Formatter, _style: display_tree::Style) -> std::fmt::Result {
+        write!(f, "{:?}", STRING_ARENA.lock().unwrap().resolve(self.0).unwrap())
+    }
 }
 
-pub enum FloatValue {
-    F32(f32),
-    F64(f64)
+#[derive(Debug)]
+#[allow(non_camel_case_types)]
+pub enum Integer {
+    i8(i8),
+    i16(i16),
+    i32(i32),
+    i64(i64),
+    i128(i128),
+
+    u8(u8),
+    u16(u16),
+    u32(u32),
+    u64(u64),
+    u128(u128),
+
+    offset(isize),
+    size(usize),
+
+    Big(rug::Integer)
+}
+
+impl Display for Integer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Integer::i8(i) => write!(f, "{}", i),
+            Integer::i16(i) => write!(f, "{}", i),
+            Integer::i32(i) => write!(f, "{}", i),
+            Integer::i64(i) => write!(f, "{}", i),
+            Integer::i128(i) => write!(f, "{}", i),
+            Integer::u8(i) => write!(f, "{}", i),
+            Integer::u16(i) => write!(f, "{}", i),
+            Integer::u32(i) => write!(f, "{}", i),
+            Integer::u64(i) => write!(f, "{}", i),
+            Integer::u128(i) => write!(f, "{}", i),
+            Integer::offset(i) => write!(f, "{}", i),
+            Integer::size(i) => write!(f, "{}", i),
+            Integer::Big(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(non_camel_case_types)]
+pub enum Float {
+    f16(f16),
+    f32(f32),
+    f64(f64),
+    f128(f128),
+    Big(rug::Float)
+}
+
+impl Display for Float {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Float::f16(fl) => write!(f, "{:?}", fl),
+            Float::f32(fl) => write!(f, "{}", fl),
+            Float::f64(fl) => write!(f, "{}", fl),
+            Float::f128(fl) => write!(f, "{:?}", fl),
+            Float::Big(fl) => write!(f, "{}", fl),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Number {
+    Integer(Integer),
+    Float(Float),
+    Rational(rug::Rational),
+    Complex(rug::Complex),
 }
 
 #[derive(Debug)]
@@ -41,6 +102,12 @@ pub struct StringLiteral {
     pub content: Atom,            // The content of the string, without the quotes, suffixes and prefixes
     
     pub suffix: Option<Atom>,     // A literal optionally ends with an identifier suffix, e.g. "..."custom_suffix
+}
+
+impl Display for StringLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", STRING_ARENA.lock().unwrap().resolve(self.content.0).unwrap())
+    }
 }
 
 #[derive(Debug)]
@@ -89,18 +156,35 @@ pub struct NumericLiteral {
     pub end_fractional_part: usize,
     pub end_number_part: usize,
 
+    pub value: Number,
+
     pub suffix: Option<Atom>,     // A literal optionally ends with an identifier suffix, e.g. ...f32
 }
+
+// implt display for NumericLiteral
+impl Display for NumericLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.value {
+            Number::Integer(int) => write!(f, "{}", int),
+            Number::Float(float) => write!(f, "{}", float),
+            Number::Rational(rational) => write!(f, "{}", rational),
+            Number::Complex(complex) => write!(f, "{}", complex),
+        }
+    }
+}
+
+pub type StringLiteralRef = &'static StringLiteral;
+pub type NumericLiteralRef = &'static NumericLiteral;
 
 #[derive(Clone, Debug)]
 pub enum TokenValue {
     NewLine,             // \n
 
     Identifier(Atom),    // any sequence of alphanumeric unicode characters or _, starting with alphabetic or underscore
-    Keyword(Atom),       // any identifier which matches a keyword
+    Keyword(Atom),       // any identifier which matched a keyword
 
-    String(Atom),        // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
-    Number,
+    String(StringLiteralRef),    // any text surrounded with ', ", ''', or """; r, b, u prefixes and arbitrary suffixes
+    Number(NumericLiteralRef),   // any integer, float or imaginary number. At this stage they are initialized to Integer::Big, Float::Big or Float::f32
 
     Punctuation(Atom),   // a sequence of arbitrary unicode punctuation
     

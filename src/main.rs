@@ -1,29 +1,28 @@
 #![feature(allocator_api)]
 
+#![feature(f16)]
+#![feature(f128)]
+
 use anstyle::{AnsiColor, Reset, RgbColor};
-use bumpalo::BumpSync;
-use bumpalo::Herd;
 
 use clap::Parser;
 
 use display_tree::println_tree;
 use itertools::enumerate;
+use lazy_static::lazy_static;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use string_interner::backend::StringBackend;
-use string_interner::StringInterner;
-use thread_local::ThreadLocal;
 
 use core::str;
-use std::fs;
-use std::sync::Mutex;
+use std::{fs::File, io::Read, sync::RwLock};
 
 mod annotations;
 
 mod parse;
 use parse::*;
 
-mod bucket_array;
+mod utf8;
+use utf8::*;
 
 #[derive(clap::Parser, Debug)]
 #[command(version = "0.0.1", about = "Interpreter and compiler for a language.", long_about = None)]
@@ -36,27 +35,28 @@ struct Args {
 
     #[arg(short, long, conflicts_with = "file", default_value = "", help = "Runs the provided string as a standalone program.")]
     run: String,
+
+    #[arg(short, long, help = "Prints the inputs passed to the tokenizer as colored segmented tokens.")]
+    debug_tokens: bool,
 }
 
-const DEBUG_TOKENS: bool = false;
+lazy_static! {
+    static ref DEBUG_TOKENS: RwLock<bool> = RwLock::new(false);
+}
 
-fn tokenize<'source>(filename: Option<String>, source: &'source str) -> Result<usize, SyntaxErr<'source>> {
+fn tokenize(filename: Option<String>, source: &'static str) -> Result<TokensVec, SyntaxErrRef> {
     let tokenizer = Tokenizer::new(filename, source);
     let tokens = tokenizer.collect()?;
 
-    if DEBUG_TOKENS {
-        for t in &tokens {
-            println!("{}:    {:?}", tokens.len() + 1, t);
-            match t.value {
-                TokenValue::Identifier(atom) => println!("Ident: {}", STRING_ARENA.lock().unwrap().resolve(atom).unwrap()),
-                _ => {}
-            }
-        }
-    }
-    println!("Count: {}", tokens.len());
+    println!("Token Count: {}", tokens.len());
 
-    if DEBUG_TOKENS {
-        let colors = vec![RgbColor(237, 174, 73), RgbColor(209, 73, 91), RgbColor(0, 121, 140), RgbColor(202, 255, 208)];
+    if *DEBUG_TOKENS.read().unwrap() {
+        for (i, t) in enumerate( &tokens) {
+            println!("{}:    {:?}", i + 1, t);
+            if let TokenValue::Identifier(atom) = t.value { println!("Ident: {}", STRING_ARENA.lock().unwrap().resolve(atom.0).unwrap()) }
+        }
+
+        let colors = [RgbColor(237, 174, 73), RgbColor(209, 73, 91), RgbColor(0, 121, 140), RgbColor(202, 255, 208)];
 
         let mut color = 0;
         for t in &tokens {
@@ -64,6 +64,8 @@ fn tokenize<'source>(filename: Option<String>, source: &'source str) -> Result<u
 
             let c = colors[color];
 
+            anstream::print!("{}", &source[t.range_of_leading_white_space()]);
+            
             let s = &source[t.loc.range.clone()];
             if s.find('\n').is_some() {
                 let lines: Vec<_> = s.split('\n').collect();
@@ -76,61 +78,69 @@ fn tokenize<'source>(filename: Option<String>, source: &'source str) -> Result<u
             } else {
                 anstream::print!("{}{}{}{}", c.render_bg(), AnsiColor::Black.render_fg(), s, Reset.render());
             }
+
+            anstream::print!("{}", &source[t.range_of_trailing_white_space()]);
         }
         anstream::println!("{}", Reset.render());
     }
-    Ok(tokens.len())
+    Ok(tokens)
 }
 
 
-fn parse<'source, 'mem>(filename: Option<String>, source: &'source str) -> Result<Option<AstRef>, SyntaxErr<'source>> {
+fn parse(filename: Option<String>, source: &'static str) -> Result<AstRef, SyntaxErrRef> {
     let mut parser = crate::parse::Parser::new(filename, source)?;
     let ast = parser.parse()?;
-
-    if let Some(tree) = &ast {
-        println_tree!(*tree);
-    }
-
+    println_tree!(ast);
     Ok(ast)
-}
-use lazy_static::lazy_static;
-
-pub type ArenaRef = &'static BumpSync<'static>;
-
-lazy_static! {
-    static ref STRING_ARENA: Mutex<StringInterner<StringBackend>> = Mutex::new(StringInterner::default());
-    static ref KEYWORDS: Keywords = Keywords::new(&mut STRING_ARENA.lock().unwrap());
-
-    static ref PARSER_ARENA_HERD: Herd = Herd::new();
-    static ref PARSER_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
-
-    static ref AST_ARENA_HERD: Herd = Herd::new();
-    static ref AST_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
 }
 
 fn main() {
     let args = Args::parse();
+    *DEBUG_TOKENS.write().unwrap() = args.debug_tokens;
 
-    std::env::set_var("RUST_BACKTRACE", "full");
+    std::env::set_var("RUST_BACKTRACE", "verbose");
+
+    let parser_arena: ArenaRef = PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get());
 
     if !args.add.is_empty() {
-        if let Err(e) = parse(Some("<--add>".to_string()), &args.add) { anstream::println!("{}", e); return; }
+        let source = parser_arena.alloc_str(&args.add);
+        if let Err(e) = parse(Some("<--add>".to_string()), source) { anstream::println!("{}", e); return; }
     }
     
     if !args.run.is_empty() {
-        if let Err(e) = parse(Some("<--run>".to_string()), &args.run) { anstream::println!("{}", e); return; }
+        let source = parser_arena.alloc_str(&args.run);
+        if let Err(e) = parse(Some("<--run>".to_string()), source) { anstream::println!("{}", e); return; }
         return;
     }
 
-    if let Some(file) = args.file {
-        match fs::read_to_string(&file) {
-            Ok(mut contents) => {
-                contents = contents.trim_start_matches("\u{feff}").to_string().replace("\r\n", "\n"); // Handle BOM and Windows newlines
-                if let Err(e) = parse(Some(file), &contents) { anstream::println!("{}", e); return; }
+    if let Some(filepath) = args.file {
+        match File::open(filepath.clone()) {
+            Ok(mut file) => {
+                let size = file.metadata().map(|m| m.len() as usize).ok().unwrap_or(0);
+
+                let mut buffer = vec![0; size];
+                let mut buffer = buffer.as_mut_slice();
+                
+                file.read_exact(buffer).expect("internal error; file read was different size than allocated");
+                buffer = utf8_normalize_newlines_and_remove_bom(buffer);
+
+                let mut contents: Vec<u8> = Vec::with_capacity(size);
+
+                let mut repl = [0; 4];
+                char::REPLACEMENT_CHARACTER.encode_utf8(repl.as_mut_slice());
+
+                for chunk in Utf8Lossy::from_bytes(buffer).chunks() {
+                    contents.extend_from_slice(chunk.valid.as_bytes());
+                    if !chunk.broken.is_empty() {
+                        contents.extend_from_slice(repl.as_slice());
+                    }
+                }
+
+                let contents_str = parser_arena.alloc_str(unsafe { str::from_utf8_unchecked(contents.as_slice()) });
+                if let Err(e) = parse(Some(filepath), contents_str) { anstream::println!("{}", e); return; }
+
             }
-            Err(err) => {
-                println!("{}: {}", &file, err);
-            }
+            Err(err) => println!("{}: {}", &filepath, err),
         }
         return;
     } 
@@ -156,7 +166,11 @@ fn main() {
                     continue;
                 }
 
-                if let Err(e) = parse(None, &input) { 
+                // We need to keep all sources alive statically, since
+                // input is overwritten on the next interactive input.
+                // Tokens and the Ast need to refer to the source they were parsed from.
+                let source = parser_arena.alloc_str(&input);
+                if let Err(e) = parse(None, source) { 
                     if e.in_interactive_interpreter_should_discard_and_instead_read_more_lines {
                         input.push('\n');
 

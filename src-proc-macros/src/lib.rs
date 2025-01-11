@@ -7,7 +7,7 @@ use quote::quote;
 #[proc_macro_derive(InitKeywords)]
 pub fn derive_init_keywords(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    
+
     let name = input.ident;
 
     let Data::Struct(struct_data) = input.data else { unimplemented!(); };
@@ -26,7 +26,7 @@ pub fn derive_init_keywords(input: TokenStream) -> TokenStream {
         impl #name {
             pub fn new(string_arena: &mut string_interner::StringInterner<string_interner::backend::StringBackend>) -> Self {
                 Self {
-                    #( #fields_as_idents : string_arena.get_or_intern_static(#fields_as_strings), )*
+                    #( #fields_as_idents : Atom(string_arena.get_or_intern_static((#fields_as_strings).trim_start_matches("r#"))), )*
                 }
             }
 

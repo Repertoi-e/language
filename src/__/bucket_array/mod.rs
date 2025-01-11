@@ -237,13 +237,13 @@ impl<'bump, T> BucketArray<'bump, T> {
     pub fn new_in(bump: &'bump Bump) -> Self {
         Self {
             len: 0,
-            buckets: Vec::<_, &'bump Bump>::new_in(&bump),
-            bump: bump,
+            buckets: Vec::<_, &'bump Bump>::new_in(bump),
+            bump,
         }
     }
 
     pub fn iter(&self) -> Iter<T> { Iter::new(self) }
-    pub fn iter_mut(&'bump mut self) -> IterMut<T> { IterMut::new(self) }
+    pub fn iter_mut(&'bump mut self) -> IterMut<'bump, T> { IterMut::new(self) }
 
     pub fn first(&self) -> Option<&T> {
         if self.buckets.is_empty() { return None }

@@ -20,14 +20,15 @@ rustyline = "14.0.0"
 anstream = "0.6.15"
 anstyle = "1.0.8"
 
+lazy_static = "1.5.0"
+thread_local = "1.1.8"
+
 bumpalo = { path = "bumpalo" }
 string-interner = { path = "string-interner", features = ["inline-more"] }
 
 unicode-properties = "0.1.2"
 unicode-width = "0.1.11"
 
-fixed = "1.28.0"
-num-bigint = "0.4.6"
 display_tree = "1.1.2"
-lazy_static = "1.5.0"
-thread_local = "1.1.8"
+rug = "1.26.1"
+

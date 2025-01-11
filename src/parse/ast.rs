@@ -1,20 +1,12 @@
-use std::{fmt::Display, ops::Range};
+use std::{fmt::{self, Display, Formatter}, ops::Range};
 
 use bumpalo::BumpSync;
-use display_tree::DisplayTree;
+use display_tree::{DisplayTree, Style};
 use itertools::enumerate;
 
-use crate::STRING_ARENA;
+use super::{Atom, NumericLiteralRef, StringLiteralRef};
 
-use super::{Atom, NumericLiteral, StringLiteral};
-
-pub struct Strings(pub Vec<StringLiteral, &'static BumpSync<'static>>);
-
-impl Display for StringLiteral {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", STRING_ARENA.lock().unwrap().resolve(self.content).unwrap())
-    }
-}
+pub struct Strings(pub Vec<StringLiteralRef, &'static BumpSync<'static>>);
 
 impl Display for Strings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,7 +23,7 @@ impl Display for Strings {
 
 pub enum ConstantValue {
     String(Strings),
-    Number(NumericLiteral),
+    Number(NumericLiteralRef),
     Bool(bool),
     None,
 }
@@ -40,16 +32,15 @@ impl Display for ConstantValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::String(strings) => write!(f, "{}", strings),
-            Self::Number(_) => write!(f, "Number"),
-            Self::Bool(bool) => write!(f, "{}", bool),
+            Self::Number(number) => write!(f, "Number {}", number),
+            Self::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Self::None => write!(f, "None"),
         }
     }
 }
 
 
-#[derive(Debug)]
-
+#[derive(Debug, DisplayTree)]
 pub enum BinOp {
     Add,
     Sub,
@@ -67,7 +58,25 @@ pub enum BinOp {
     BitAnd,
     
     BoolAnd,
-    BoolOr
+    BoolOr,
+
+    LeftShift,
+    RightShift,
+
+    Or,
+    And,
+
+    Eq,
+    NotEq,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+
+    In,
+    NotIn,
+    Is,
+    IsNot,
 }
 
 impl Display for BinOp {
@@ -92,41 +101,60 @@ impl Display for UnaryOp {
 }
 
 #[derive(Debug)]
-pub enum NameContext {
+pub enum ExprContext {
     Load,
     Store,
     Del
 }
 
-impl Display for NameContext {
+impl Display for ExprContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-pub struct AstVec(pub Vec<AstRef, &'static BumpSync<'static>>);
+pub struct AstVecOf<T>(pub Vec<T, &'static BumpSync<'static>>);
+pub type AstVec = AstVecOf<AstRef>;
 
-pub struct AstOption(pub Option<AstRef>);
-
-impl DisplayTree for AstOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
-        if let Some(el) = &self.0 {
-            DisplayTree::fmt(el, f, style)?;
-        }
-        std::fmt::Result::Ok(())
-    }
-}
-
-impl DisplayTree for AstVec {
-    fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
-        for (it, el) in enumerate(&self.0) {
+impl<T> DisplayTree for AstVecOf<T> where T: DisplayTree,
+{
+    fn fmt(&self, f: &mut Formatter, style: Style) -> fmt::Result {
+        for (it, el) in self.0.iter().enumerate() {
             write!(f, "[{}] ", it)?;
             DisplayTree::fmt(el, f, style)?;
             if it != self.0.len() - 1 {
-                writeln!(f, "")?
+                writeln!(f)?
             }
         }
-        std::fmt::Result::Ok(())
+        fmt::Result::Ok(())
+    }
+}
+
+pub struct AstOption<T>(pub Option<T>);
+
+impl<T> DisplayTree for AstOption<T>
+where
+    T: DisplayTree,
+{
+    fn fmt(&self, f: &mut Formatter, style: Style) -> fmt::Result {
+        if let Some(el) = &self.0 {
+            DisplayTree::fmt(el, f, style)?;
+        }
+        fmt::Result::Ok(())
+    }
+}
+
+pub enum AstSingleOrMultiple<S, M> {
+    Single(S),
+    Multiple(M),
+}
+
+impl<S, M> DisplayTree for AstSingleOrMultiple<S, M> where S: DisplayTree, M: DisplayTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter, style: display_tree::Style) -> std::fmt::Result {
+        match self {
+            Self::Single(s) => DisplayTree::fmt(s, f, style),
+            Self::Multiple(m) => DisplayTree::fmt(m, f, style)
+        }
     }
 }
 
@@ -140,33 +168,83 @@ pub enum AstKind {
     },
 
     Name {
+        #[tree]
         name: Atom,
-        ctx: NameContext,
+        ctx: ExprContext,
+    },
+
+    EmptyStatement, // Preserve this for program printing
+    
+    // List of statements on one line
+    Statements {
+        #[tree]
+        statements: AstVec,
+    },
+
+    Tuple {
+        #[tree]
+        targets: AstSingleOrMultiple<AstRef, AstVec>, 
+        ctx: ExprContext,
+    },
+
+    // Chained targets, e.g. in assignment x = y = z = ...
+    ChainedTargets {
+        #[tree]
+        targets: AstVec,
+    },
+
+    Starred {
+        #[tree]
+        value: AstRef, 
+        ctx: ExprContext,
+    },
+
+    DoubleStarred {
+        #[tree]
+        value: AstRef, 
+        ctx: ExprContext,
+    },
+
+    KeywordArg {
+        arg: Atom,
+
+        #[tree]
+        value: AstRef,
+
+        ctx: ExprContext,
     },
 
     Assign {
+        #[field_label]
         #[tree]
-        targets: AstVec,
+        target: AstRef,
+
+        #[field_label]
         #[tree]
         value: AstRef,
     },
 
     AnnAssign {
+        #[field_label]
         #[tree]
         target: AstRef,
 
+        #[field_label]
         #[tree]
         annotation: AstRef,
 
+        #[field_label]
         #[tree]
-        value: AstOption,
+        value: AstOption<AstRef>,
     },
 
     AugAssign {
         #[tree]
         target: AstRef,
+        
         #[node_label]
         op: BinOp,
+        
         #[tree]
         value: AstRef,
     },
@@ -174,20 +252,80 @@ pub enum AstKind {
     BinOp {
         #[tree]
         left: AstRef,
+
         #[node_label]
         op: BinOp,
+
         #[tree]
         right: AstRef,
     },
 
     UnaryOp {
-        op: BinOp,
+        #[node_label]
+        op: UnaryOp,
+        
         #[tree]
         operand: AstRef,
     },
 
+    BoolOp {
+        #[node_label]
+        op: BinOp,
+        
+        #[tree]
+        values: AstVec,
+    },
+
+    Compare {
+        #[tree]
+        left: AstRef,
+
+        #[tree]
+        ops: AstVecOf<BinOp>,
+
+        #[tree]
+        comparators: AstVec,
+    },
+
     Constant {
         value: ConstantValue
+    },
+
+    Await {
+        #[tree]
+        value: AstRef,
+    },
+
+    Subscript {
+        #[tree]
+        value: AstRef,
+
+        #[tree]
+        slice: AstRef,
+
+        ctx: ExprContext,
+    },
+
+    Call {
+        #[tree]
+        func: AstRef,
+
+        #[tree]
+        args: AstOption<AstRef>,
+
+        #[tree]
+        keywords: AstOption<AstRef>,
+    },
+
+    Slice {
+        #[tree]
+        lower: AstRef,
+
+        #[tree]
+        upper: AstRef,
+
+        #[tree]
+        step: AstOption<AstRef>,
     },
 
     // Only when an expression, such as a function call, appears as a statement by itself with its return value not used or stored.
@@ -196,17 +334,42 @@ pub enum AstKind {
         value: AstRef,
     },
 
+    IfExp {
+        #[tree]
+        test: AstRef,
+
+        #[tree]
+        body: AstRef,
+
+        #[tree]
+        orelse: AstRef,
+    },
+
+    NamedExpr {
+        #[tree]
+        target: AstRef,
+
+        #[tree]
+        value: AstRef,
+    },
+
     Attribute {
         #[tree]
         value: AstRef,
 
+        #[field_label]
+        #[tree]
         attribute: Atom,
+
+        ctx: ExprContext,
     },
 
     Walrus {
+        #[field_label]
         #[tree]
         target: AstRef,
 
+        #[field_label]
         #[tree]
         value: AstRef,
     },

@@ -1,7 +1,9 @@
-use bumpalo::Bump;
+use std::sync::Mutex;
+
 use src_proc_macros::InitKeywords;
 use string_interner::backend::StringBackend;
 use string_interner::StringInterner;
+use lazy_static::lazy_static;
 
 use crate::parse::token::Atom;
 
@@ -43,8 +45,8 @@ pub struct Keywords {
     pub r#yield: Atom,
 }
 
-pub struct Context<'mem> {
-    pub arena: &'mem Bump, 
-    pub keywords: Keywords,
+lazy_static! {
+    pub static ref STRING_ARENA: Mutex<StringInterner<StringBackend>> = Mutex::new(StringInterner::default());
+    pub static ref KEYWORDS: Keywords = Keywords::new(&mut STRING_ARENA.lock().unwrap());
 }
 

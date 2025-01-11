@@ -2,50 +2,68 @@ use core::str;
 use std::panic;
 use std::ops::Range;
 
-use bumpalo::BumpSync;
+use bumpalo::{BumpSync, Herd};
+use lazy_static::lazy_static;
+use rug::ops::Pow;
+use thread_local::ThreadLocal;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::annotations::Level;
 use crate::parse::syntax_err::SyntaxErr;
 use crate::parse::token::*;
-use crate::{ArenaRef, KEYWORDS, PARSER_ARENA, PARSER_ARENA_HERD, STRING_ARENA};
+
+use super::{SyntaxErrRef, KEYWORDS, STRING_ARENA};
+
+pub type ArenaRef = &'static BumpSync<'static>;
+
+lazy_static! {
+    pub static ref TOKEN_ARENA_HERD: Herd = Herd::new();
+    pub static ref TOKEN_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
+
+    pub static ref PARSER_ARENA_HERD: Herd = Herd::new();
+    pub static ref PARSER_ARENA: ThreadLocal<BumpSync<'static>> = ThreadLocal::new();
+}
 
 pub type TokensVec = Vec<Token, &'static BumpSync<'static>>;
 
-
-pub struct Tokenizer<'source> {
+pub struct Tokenizer {
     pub filename: Option<String>,
-    pub source: &'source str,
+    pub source: &'static str,
+
+    bytes: &'static [u8],
 
     it: usize, // Byte iterator
 
-    token_arena: ArenaRef,
+    parser_arena: ArenaRef,
     tokens: TokensVec,
 
     leading_whitespace: usize // Gets consumed into the next non white space token 
 }
 
-impl<'source> Tokenizer<'source> {
-    pub fn new(filename: Option<String>, input: &'source str) -> Self {
-        let approximate_token_count: usize = ((input.len() / 3) as f64 * 0.6) as usize; // Assume 30% empty space and 3 bytes per token as nice estimate
+impl Tokenizer {
+    pub fn new(filename: Option<String>, input: &'static str) -> Self {
+        let approximate_token_count: usize = input.len() / 3; // Assume 3 bytes per token as estimate
 
-        let token_arena = PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get());
+        let token_arena = TOKEN_ARENA.get_or(|| TOKEN_ARENA_HERD.get());
         Self { 
             filename,
             source: input,
+            bytes: input.as_bytes(),
             it: 0,
             tokens: Vec::with_capacity_in(approximate_token_count, token_arena),
-            token_arena, 
+            parser_arena: PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get()),
             leading_whitespace: 0
         }
     }
 
-    pub fn collect(mut self) -> Result<TokensVec, SyntaxErr<'source>> {
-        while let Some(_) = self.next_token()? {}
+    pub fn collect(mut self) -> Result<TokensVec, SyntaxErrRef> {
+        while self.it < self.bytes.len() { 
+            self.next_token()?;
+        }
         Ok(self.tokens)
     }
 
-    pub fn parse_string_literal(&mut self) -> Result<Option<StringLiteral>, SyntaxErr<'source>> {
+    fn parse_string_literal(&mut self) -> Result<Option<StringLiteralRef>, SyntaxErrRef> {
         if let Some(ch) = self.peek() {
             let begin_p = self.it;
 
@@ -65,7 +83,7 @@ impl<'source> Tokenizer<'source> {
             }
 
             // Parse a number of hashes for a raw string, to build the expected terminating sequence.
-            let mut parse_until_vec = Vec::<u8, _>::new_in(self.token_arena); // Since we're allocating in the arena the string can grow without copying
+            let mut parse_until_vec = Vec::<u8, _>::new_in(self.parser_arena); // Since we're allocating in the arena the string can grow without copying
             if is_raw {
                 while self.peek_nth_is(begin_offset,  b'#') {
                     parse_until_vec.push(b'#');
@@ -113,11 +131,13 @@ impl<'source> Tokenizer<'source> {
             // so it can be checked if it already exists in the string table. If we just push strings the string table 
             // arena and do deduplication later, then at that time we'd have to drop and copy all the non-repeating ones anyway.
             // In any case a copy has to happen. 
-            let mut content = Vec::<u8, _>::new_in(self.token_arena); // Since we're allocating in the arena the string can grow without copying
+            let mut content = Vec::<u8, _>::new_in(self.parser_arena); // Since we're allocating in the arena the string can grow without copying
 
-            while !self.match_sequence(&parse_until) {
+            while !self.match_sequence(parse_until) {
+                let p = self.it;
+
                 match self.next() {
-                    Some((p, ch)) => {
+                    Some(ch) => {
                         if !is_raw {
                             // Handle string continue, i.e. escaping newline
                             if matches!((ch, self.peek()), ('\\', Some(b'\n'))) {
@@ -128,7 +148,7 @@ impl<'source> Tokenizer<'source> {
                             // Handle string ending before end of line when the new line is not escaped (string continue)
                             if ch == '\n' && !is_multiline {
                                 return Err(self.syntax_err().loc_msg(begin_p..self.it, "string literal was not ended before end of line")
-                                    .suggestion(self.it-1, &parse_until, "end the string")
+                                    .suggestion(self.it-1, parse_until, "end the string")
                                     .suggestion(self.it-1, "\\", "... or use line continuation to extend the string on the next line")
                                 );
                             }
@@ -136,7 +156,7 @@ impl<'source> Tokenizer<'source> {
                             // Handle unicode sequence
                             if matches!((ch, self.peek()), ('\\', Some(b)) if b.eq_ignore_ascii_case(&b'u')) {
                                 let mut num_digits = 8; // 8 for 'U'
-                                if let Some((_, 'u')) = self.next() {
+                                if let Some('u') = self.next() {
                                     num_digits = 4; // 4 for 'u'
                                 }
             
@@ -170,14 +190,14 @@ impl<'source> Tokenizer<'source> {
                             // Handle other escapes
                             if ch == '\\' {
                                 match self.next() {
-                                    Some((_, '\'')) => { content.push(b'\''); continue; }
-                                    Some((_, '"')) => { content.push(b'"'); continue; }
-                                    Some((_, 'n')) => { content.push(b'\n'); continue; }
-                                    Some((_, 'r')) => { content.push(b'\r'); continue; }
-                                    Some((_, 't')) => { content.push(b'\t'); continue; }
-                                    Some((_, '\\')) => { content.push(b'\\'); continue; }
-                                    Some((_, '0')) => { content.push(b'\0'); continue; }
-                                    Some((_, 'x')) => {
+                                    Some('\'') => { content.push(b'\''); continue; }
+                                    Some('"') => { content.push(b'"'); continue; }
+                                    Some('n') => { content.push(b'\n'); continue; }
+                                    Some('r') => { content.push(b'\r'); continue; }
+                                    Some('t') => { content.push(b'\t'); continue; }
+                                    Some('\\') => { content.push(b'\\'); continue; }
+                                    Some('0') => { content.push(b'\0'); continue; }
+                                    Some('x') => {
                                         let mut sum = 0;
                                         for _ in 0..2 {
 
@@ -205,7 +225,7 @@ impl<'source> Tokenizer<'source> {
                                         }
                                         continue;
                                     }
-                                    Some((_, _)) => {
+                                    Some(_) => {
                                         return Err(self.syntax_err().loc_msg(
                                             p..p+2, 
                                             "unknown escape, expected one of: \\\', \\\", \\\\, \\n, \\r, \\t, \\0, byte escape \\xXX, or one of unicode escapes \\uXXXX, \\UXXXXXXXX, where X is a hexadecimal digit"
@@ -226,37 +246,37 @@ impl<'source> Tokenizer<'source> {
                         return Err(self.syntax_err().loc_msg(
                                begin_p..self.it,
                                 "string literal was not ended",
-                            ).suggestion(self.it, &parse_until, "end the string")
+                            ).suggestion(self.it, parse_until, "end the string")
                             .in_interactive_interpreter_should_discard_and_instead_read_more_lines(is_multiline)
                         );
                     }
                 }
             }
 
-            let end_p = self.match_sequence_expect_and_eat(&parse_until)?;
+            let end_p = self.match_sequence_expect_and_eat(parse_until)?;
 
             let mut suffix = None;
-            if matches!(self.peek_cp(), Some((_, c)) if is_ident(c, true)) {
+            if matches!(self.peek_cp(), Some(c) if is_ident(c, true)) {
                 let range = self.expect_and_eat_ident_range();
                 suffix = Some(self.atom(&self.source[range]))
             }
 
             let atom = self.atom(unsafe { str::from_utf8_unchecked(&content) });
-            let literal = StringLiteral {
+            let literal = self.parser_arena.alloc(StringLiteral {
                 code_location: begin_p..self.it,
                 begin_quote: begin_p..begin_p+begin_offset,
-                end_quote: end_p..end_p+&parse_until.len(),
+                end_quote: end_p..end_p+parse_until.len(),
                 is_byte_string: is_byte,
                 content: atom,
-                suffix: suffix,
-            };
-            return Ok(Some(literal));
+                suffix,
+            });
+            Ok(Some(literal))
         } else {
             Ok(None)
         }
     }
 
-    pub fn parse_numeric_literal(&mut self) -> Result<NumericLiteral, SyntaxErr<'source>> {
+    fn parse_numeric_literal(&mut self) -> Result<NumericLiteralRef, SyntaxErrRef> {
         let first = self.peek().take_if(|x| x.is_ascii_digit() || *x == b'.').unwrap_or_default();
         
         if first == 0 {
@@ -324,7 +344,7 @@ impl<'source> Tokenizer<'source> {
 
         // Optional fractional part
         let end_fractional_part = if matches!(self.peek(), Some(b'.')) {
-            if base != 10 && base != 16 {
+            if base != 10 {
                 return Err(self.syntax_err()
                     .loc_msg(self.it..self.it+1, "numbers in this base can't have a fractional part")
                     .annotation(Level::Info, begin_p..begin_p+2, &format!("prefix for base {}", base), true)
@@ -364,7 +384,7 @@ impl<'source> Tokenizer<'source> {
         last_underscore = false;
 
         // Optional exponent part
-        let end_number_part = if (base == 10 && matches!(self.peek(), Some(b'e' | b'E'))) || (base == 16 && matches!(self.peek(), Some(b'p' | b'P'))) {
+        let end_number_part = if matches!(self.peek(), Some(b'e' | b'E')) {
             self.advance(1);
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.advance(1);
@@ -372,12 +392,7 @@ impl<'source> Tokenizer<'source> {
             
             if self.peek() == Some(b'_') {
                 return Err(self.syntax_err()
-                    .loc_msg(self.it..self.it+1, 
-                        if base == 16 { 
-                            "exponents for hex floats can't start with _, _ can be used as a digit separator in other places though" 
-                        } else { 
-                            "exponent of a number in scientific notation can't start with _, _ can be used as a digit separator in other places though"
-                        }
+                    .loc_msg(self.it..self.it+1, "exponent of a number in scientific notation can't start with _, _ can be used as a digit separator in other places though"
                     )
                     .suggestion_replace(self.it..self.it+1, "", "remove the underscore")
                 );
@@ -387,11 +402,6 @@ impl<'source> Tokenizer<'source> {
             
             while let Some(byte) = self.peek() {
                 if is_digit(byte, base) { 
-                    if !is_digit(byte, 10) {
-                        return Err(self.syntax_err()
-                            .loc_msg(self.it..self.it+1, "exponents for hex floats can only contain decimal digits")
-                        );
-                    }
                     last_underscore = byte == b'_'; 
                     self.advance(1);
                 } 
@@ -402,40 +412,20 @@ impl<'source> Tokenizer<'source> {
 
             if last_underscore {
                 return Err(self.syntax_err()
-                    .loc_msg(self.it-1..self.it, 
-                        if base == 16 { 
-                            "exponent of a hex float can't end with _, _ can be used as a digit separator in other places though"
-                        } else { 
-                            "exponent of a number in scientific notation can't end with _, _ can be used as a digit separator in other places though"
-                        }
-                    )
+                    .loc_msg(self.it-1..self.it, "exponent of a number in scientific notation can't end with _, _ can be used as a digit separator in other places though")
                     .suggestion_replace(self.it-1..self.it, "", "remove the underscore")
                 );
             }
 
             if self.it == e_begin {
                 return Err(self.syntax_err()
-                    .loc_msg(e_begin..e_begin+2, 
-                        if base == 16 { 
-                            "hex float doesn't have digits in the exponent"
-                        } else {
-                            "number in scientific notation doesn't have digits in the exponent"
-                        }
-                    )
+                    .loc_msg(e_begin..e_begin+2, "number in scientific notation doesn't have digits in the exponent")
                 );
             }
             self.it
         } else {
             end_fractional_part
         };
-
-        // If base 16 and has fractional part, but no exponent part
-        if base == 16 && end_fractional_part != end_integer_part && end_fractional_part == end_number_part {
-            return Err(self.syntax_err()
-                .loc_msg(begin_p..end_number_part, "hex float ends without an exponent, the exponent is never optional for hex floats")
-                .suggestion(end_number_part, "p0", "add a dummy exponent")
-            );
-        }
 
         if end_integer_part == end_number_part {
             // If an integer and not composed of only zeros and has leading zeros
@@ -449,7 +439,7 @@ impl<'source> Tokenizer<'source> {
         }
         
         let mut suffix = None;
-        if matches!(self.peek_cp(), Some((_, c)) if is_ident(c, true)) {
+        if matches!(self.peek_cp(), Some(c) if is_ident(c, true)) {
             let range = self.expect_and_eat_ident_range();
             let str = &self.source[range];
             if str == "_" {
@@ -461,17 +451,43 @@ impl<'source> Tokenizer<'source> {
             suffix = Some(self.atom(str))
         }
 
-        Ok(NumericLiteral {
+        // @Speed This should be parsed later during type-checking since right now there's no way to know which size it is.
+        
+        let value = if end_fractional_part != end_number_part {
+            Number::Float(Float::Big(rug::Float::with_val(200, rug::Float::parse(&self.source[begin_p..end_number_part]).unwrap())))
+        } else if end_integer_part != end_fractional_part {
+            let integer_str = &self.source[begin_p..end_integer_part];
+            let integer = if integer_str.len() == 0 {
+                rug::Rational::from((0, 1))
+            } else {
+                rug::Rational::from_str_radix(integer_str, base as i32).unwrap()
+            };
+            
+            let fractional_str: &str = &self.source[end_integer_part+1..end_number_part];
+            let fractional = if fractional_str.len() == 0 {
+                rug::Integer::from(0)
+            } else {
+                rug::Integer::from_str_radix(fractional_str, base as i32).unwrap()
+            };
+
+            let denominator = rug::Integer::from(10).pow(fractional_str.len() as u32);
+            Number::Rational(integer + rug::Rational::from((fractional, denominator)))
+        } else {
+            Number::Integer(Integer::Big(rug::Integer::from_str_radix(&self.source[begin_p..end_number_part], base as i32).unwrap()))
+        };
+
+        Ok(self.parser_arena.alloc(NumericLiteral {
             code_location: begin_p..self.it,
             base: if end_base == 0 { None } else { Some(base) },
             end_integer_part: end_integer_part - begin_p,
             end_fractional_part: end_fractional_part - begin_p,
             end_number_part: end_number_part - begin_p,
+            value,
             suffix
-        })
+        }))
     }
 
-    pub fn next_token(&mut self) -> Result<Option<usize>, SyntaxErr<'source>> {
+    fn next_token(&mut self) -> Result<(), SyntaxErrRef> {
         let p = self.it;
 
         macro_rules! match_self_peek {
@@ -480,9 +496,9 @@ impl<'source> Tokenizer<'source> {
                 $( ; $( $custom_pat:pat => $custom_case:block ),+ )+       // Other matches with Some(..)
             ) => {
                 match self.peek() {
-                    $( Some($byte) => { Ok(Some(self.eat_byte_and_emit_unchecked($token_value))) } )*
+                    $( Some($byte) => { Ok(self.eat_byte_and_emit_unchecked($token_value)) } )*
                     $( $($custom_pat => { $custom_case })* )*
-                    None => Ok(None),
+                    None => Ok(()),
                 }
             };
         }
@@ -505,95 +521,95 @@ impl<'source> Tokenizer<'source> {
             Some(b'.') => { 
                 if self.peek_nth_is(1, b'.') {
                     if self.peek_nth_is(2, b'.') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3,TokenValue::Ellipsis)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3,TokenValue::Ellipsis))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::DotDot)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::DotDot))
                     }
                 } else if self.peek_nth(1).take_if(|x| x.is_ascii_digit()).is_some() {
                     let numeric_literal = self.parse_numeric_literal()?;
-                    Ok(Some(self.new_token(TokenValue::Number,numeric_literal.code_location)))
+                    Ok(self.new_token(TokenValue::Number(numeric_literal), numeric_literal.code_location.clone()))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Dot)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Dot))
                 }
             },
 
             Some(b'=') => { 
                 if self.peek_nth_is(1, b'>') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ThickArrow)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ThickArrow))
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::EqualEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::EqualEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Equal)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Equal))
                 }
             },
 
             Some(b'!') => { 
                 if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::NotEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::NotEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Not)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Not))
                 }
             },
 
             Some(b'|') => { 
                 if self.peek_nth_is(1, b'|') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::Or)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::Or))
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::BitwiseOrEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::BitwiseOrEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::BitwiseOr)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::BitwiseOr))
                 }
             },
 
             Some(b'&') => { 
                 if self.peek_nth_is(1, b'&') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::And)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::And))
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::BitwiseAndEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::BitwiseAndEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::BitwiseAnd)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::BitwiseAnd))
                 }
             },
 
             Some(b':') => { 
                 if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::Walrus)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::Walrus))
                 } else if self.peek_nth_is(1, b':') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ColonColon)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ColonColon))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Colon)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Colon))
                 }
             },
 
             Some(b'+') => { 
                 if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::PlusEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::PlusEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Plus)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Plus))
                 }
             },
 
             Some(b'-') => { 
                 if self.peek_nth_is(1, b'>') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ThinArrow)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ThinArrow))
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::MinusEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::MinusEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Minus)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Minus))
                 }
             },
 
             Some(b'*') => { 
                 if self.peek_nth_is(1, b'*') {
                     if self.peek_nth_is(2, b'*') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3,TokenValue::PowerEqual)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3,TokenValue::PowerEqual))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::Power)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::Power))
                     }
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::TimesEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::TimesEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Times)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Times))
                 }
             },
 
@@ -605,11 +621,11 @@ impl<'source> Tokenizer<'source> {
                     /* while !self.peek_nth_is(0, b'\n') { // Eat singleline comment
                         self.advance(1);
                     }
-                    return Ok(Some(self.new_token(TokenValue::Comment, p..self.it))); */
+                    return Ok(self.new_token(TokenValue::Comment, p..self.it))); */
                     if self.peek_nth_is(2, b'=') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3, TokenValue::DivideFloorEqual)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3, TokenValue::DivideFloorEqual))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::DivideFloor)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::DivideFloor))
                     }
                 } /*else if self.peek_nth_is(1, b'_') {
                     if self.peek_nth_is(2, b'=') {
@@ -618,17 +634,17 @@ impl<'source> Tokenizer<'source> {
                         Ok(self.eat_bytes_and_emit_unchecked(2, TokenValue::DivideFloor))
                     }
                 }*/ else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::DivideEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::DivideEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Divide)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Divide))
                 }
             },
 
             Some(b'%') => { 
                 if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ModEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ModEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Mod)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Mod))
                 }
             },
 
@@ -636,45 +652,45 @@ impl<'source> Tokenizer<'source> {
                 /*if is_ident(self.peek_cp().unwrap_or_default().1, true) {
                     self.expect_and_eat_ident_range();
                     let atom = self.atom(&self.source[p..self.it]);
-                    return Ok(Some(self.new_token(TokenValue::Directive(atom), p..self.it)))
+                    return Ok(self.new_token(TokenValue::Directive(atom), p..self.it)))
                 }*/
 
                 if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::AtEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::AtEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::At)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::At))
                 }
             },
 
             Some(b'<') => { 
                 if self.peek_nth_is(1, b'<') {
                     if self.peek_nth_is(2, b'=') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3,TokenValue::ShiftLeftEqual)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3,TokenValue::ShiftLeftEqual))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ShiftLeft)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ShiftLeft))
                     }
                 } else if self.peek_nth_is(1, b'=') {
                     if self.peek_nth_is(2, b'>') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3,TokenValue::Spaceship)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3,TokenValue::Spaceship))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::LessOrEqual)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::LessOrEqual))
                     }
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Less)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Less))
                 }
             },
 
             Some(b'>') => { 
                 if self.peek_nth_is(1, b'>') {
                     if self.peek_nth_is(2, b'=') {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(3,TokenValue::ShiftRightEqual)))
+                        Ok(self.eat_bytes_and_emit_unchecked(3,TokenValue::ShiftRightEqual))
                     } else {
-                        Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::ShiftRight)))
+                        Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::ShiftRight))
                     }
                 } else if self.peek_nth_is(1, b'=') {
-                    Ok(Some(self.eat_bytes_and_emit_unchecked(2,TokenValue::GreaterOrEqual)))
+                    Ok(self.eat_bytes_and_emit_unchecked(2,TokenValue::GreaterOrEqual))
                 } else {
-                    Ok(Some(self.eat_byte_and_emit_unchecked(TokenValue::Greater)))
+                    Ok(self.eat_byte_and_emit_unchecked(TokenValue::Greater))
                 }
             },
 
@@ -689,7 +705,7 @@ impl<'source> Tokenizer<'source> {
                 if is_ident(self.peek_cp().unwrap_or_default().1, true) {
                     self.expect_and_eat_ident_range();
                     let atom = self.atom(&self.source[p..self.it]);
-                    return Ok(Some(self.new_token(TokenValue::Directive(atom), p..self.it)))
+                    return Ok(self.new_token(TokenValue::Directive(atom), p..self.it))
                 } else {
                     Err(self.syntax_err().loc_msg(p..p+1, "expected identifier after # while parsing compiler directive"))
                 }*/
@@ -697,12 +713,12 @@ impl<'source> Tokenizer<'source> {
 
             Some(b'0'..=b'9') => {
                 let numeric_literal = self.parse_numeric_literal()?;
-                Ok(Some(self.new_token(TokenValue::Number,numeric_literal.code_location)))
+                Ok(self.new_token(TokenValue::Number(numeric_literal), numeric_literal.code_location.clone()))
             },
 
             Some(b'\'' | b'"') => {
                 if let Some(string_literal) = self.parse_string_literal()? {
-                    Ok(Some(self.new_token(TokenValue::String(string_literal.content),string_literal.code_location)))
+                    Ok(self.new_token(TokenValue::String(string_literal), string_literal.code_location.clone()))
                 } else {
                     Err(self.syntax_err().loc_msg(p..p+1, "expected a string literal after quote"))
                 }
@@ -710,27 +726,27 @@ impl<'source> Tokenizer<'source> {
 
             Some(b'b' | b'r' | b'u') => {
                 if let Some(string_literal) = self.parse_string_literal()? {
-                    Ok(Some(self.new_token(TokenValue::String(string_literal.content),string_literal.code_location)))
+                    Ok(self.new_token(TokenValue::String(string_literal), string_literal.code_location.clone()))
                 } else {
-                    Ok(Some(self.expect_and_eat_ident()))
+                    Ok(self.expect_and_eat_ident())
                 }
             },
 
             Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => { // ASCII idents shortcut
-                Ok(Some(self.expect_and_eat_ident()))
+                Ok(self.expect_and_eat_ident())
             },
 
             Some(_) => {
-                if matches!(self.peek_cp(), Some((_, ch)) if ch.is_whitespace()) {
+                if matches!(self.peek_cp(), Some(ch) if ch.is_whitespace()) {
                     self.leading_whitespace += self.eat_white_space();
                     self.next_token() // Recurse to get the next non white space token
-                } else if matches!(self.peek_cp(), Some((_, ch)) if ch.general_category_group() == GeneralCategoryGroup::Punctuation) {
+                } else if matches!(self.peek_cp(), Some(ch) if ch.general_category_group() == GeneralCategoryGroup::Punctuation) {
                     // Eat arbitrary continuous unicode punctuation
-                    while matches!(self.peek_cp(), Some((_, ch)) if ch.general_category_group() == GeneralCategoryGroup::Punctuation) {
+                    while matches!(self.peek_cp(), Some(ch) if ch.general_category_group() == GeneralCategoryGroup::Punctuation) {
                         self.advance_cp(1);
                     }
                     let atom = self.atom(&self.source[p..self.it]);
-                    Ok(Some(self.new_token(TokenValue::Punctuation(atom),p..self.it)))
+                    Ok(self.new_token(TokenValue::Punctuation(atom),p..self.it))
                 } else {
                     // Eat arbitrary unicode identifiers
                     Ok(self.try_eat_identifier()?)
@@ -739,14 +755,11 @@ impl<'source> Tokenizer<'source> {
         }
     }    
 
-}
-
-impl<'source> Tokenizer<'source> {
     #[inline]
-    fn new_token(&mut self, value: TokenValue, range: Range<usize>) -> usize {
+    fn new_token(&mut self, value: TokenValue, range: Range<usize>) {
         let trailing_whitespace = self.eat_white_space();
         self.tokens.push(Token { 
-            value: value, 
+            value, 
             loc: CodeLocation { 
                 range, 
                 leading_whitespace: self.leading_whitespace,
@@ -754,34 +767,31 @@ impl<'source> Tokenizer<'source> {
             } 
         });
         self.leading_whitespace = 0; // Consumed
-        self.tokens.len()-1
     }
 
     #[inline]
-    fn peek_nth(&self, i: usize) -> Option<u8> { 
-        if self.it + i < self.source.len() {
-            Some(self.source.as_bytes()[self.it + i])
-        } else {
-            None
-        }
-    }
+    fn peek_nth(&self, i: usize) -> Option<u8> { if self.it + i < self.bytes.len() { Some(self.bytes[self.it + i]) } else { None } }
     
     #[inline]
-    fn peek_nth_is(&self, i: usize, b: u8) -> bool { matches!(self.peek_nth(i), Some(ch) if ch == b) }
+    fn peek_nth_is(&self, i: usize, b: u8) -> bool { if self.it + i < self.bytes.len() { self.bytes[self.it + i] == b } else { false } }
 
     #[inline]
     fn peek(&self) -> Option<u8> { self.peek_nth(0) }
 
     #[inline]
-    fn peek_cp(&self) -> Option<(usize, char)> { 
-        next_code_point(&self.source.as_bytes()[self.it..]).map(|ch| (self.it, ch))
+    fn peek_cp(&self) -> Option<char> {
+        if self.it < self.bytes.len() {
+            Some(next_code_point(unsafe { self.bytes.as_ptr().add(self.it) }))
+        } else {
+            None
+        }
     }
 
     #[inline]
-    fn next(&mut self) -> Option<(usize, char)> {
-        return if let Some((p, ch)) = self.peek_cp() {
+    fn next(&mut self) -> Option<char> {
+        if let Some(ch) = self.peek_cp() {
             self.it += ch.len_utf8();
-            Some((p, ch))
+            Some(ch)
         } else {
             None
         }
@@ -793,7 +803,7 @@ impl<'source> Tokenizer<'source> {
     #[inline]
     fn advance_cp(&mut self, count: usize) {
         for _ in 0..count {
-            if let Some((_, ch)) = self.peek_cp() {
+            if let Some(ch) = self.peek_cp() {
                 self.advance(ch.len_utf8());
             } else {
                 println!("internal error; tried to advance parse pointer by {} code points here, but failed", count);
@@ -805,14 +815,33 @@ impl<'source> Tokenizer<'source> {
     fn eat_white_space(&mut self) -> usize {
         let mut bytes: usize = 0;
 
-        let mut prev = None;
-        while let Some(p) = self.peek_cp() {
-            if matches!(p, (_, ch) if !ch.is_whitespace() || (ch == '\n' && !matches!(prev, Some((_, '\\'))))) {
+        loop {
+            // First eat the white space, this will probably be the main case
+            while let Some(p) = self.peek() {
+                if !p.is_ascii_whitespace() || p == b'\n' {
+                    // Check for line cont.
+                    if p == b'\\' && self.peek_nth_is(1, b'\n') {
+                        bytes += 2;
+                        self.advance(2);
+                        continue;
+                    }
+                    break;
+                }
+                bytes += 1;
+                self.advance_cp(1);
+            }
+
+            // Handle other unicode white space
+            if let Some(ch) = self.peek_cp() {
+                if !ch.is_whitespace() {
+                    break;
+                }
+                let len = ch.len_utf8();
+                bytes += len;
+                self.advance_cp(len);
+            } else {
                 break;
             }
-            bytes = bytes.saturating_add(p.1.len_utf8());
-            prev = Some(p);
-            self.advance_cp(1);
         }
         bytes
     }
@@ -822,19 +851,19 @@ impl<'source> Tokenizer<'source> {
     }
 
     // Assumes byte already matches!
-    fn eat_byte_and_emit_unchecked(&mut self, value: TokenValue) -> usize {
+    fn eat_byte_and_emit_unchecked(&mut self, value: TokenValue) {
         self.eat_bytes_and_emit_unchecked(1, value)
     }
 
     // Assumes byte already matches!
-    fn eat_bytes_and_emit_unchecked(&mut self, i: usize, value: TokenValue) -> usize {
+    fn eat_bytes_and_emit_unchecked(&mut self, i: usize, value: TokenValue) {
         let p = self.it;
         self.advance(i);
         self.new_token(value, p..p+i)
     }
 
     // Returns the pointer to the beginning of the sequence that was eaten
-    fn match_sequence_expect_and_eat(&mut self, sequence: &str) -> Result<usize, SyntaxErr<'source>> {
+    fn match_sequence_expect_and_eat(&mut self, sequence: &str) -> Result<usize, SyntaxErrRef> {
         let p = self.it;
         if !self.match_sequence(sequence) {
             return Err(self.syntax_err().loc_msg(p..p+sequence.len(), &format!("expected \"{}\"", sequence)));
@@ -843,7 +872,7 @@ impl<'source> Tokenizer<'source> {
         Ok(p)
     }
 
-    fn eat_multiline_comment(&mut self) -> Result<usize, SyntaxErr<'source>> {
+    fn eat_multiline_comment(&mut self) -> Result<usize, SyntaxErrRef> {
         let p = self.match_sequence_expect_and_eat("/*")?;
 
         let mut did_recurse = false;
@@ -868,17 +897,18 @@ impl<'source> Tokenizer<'source> {
     }
 
     #[inline]
-    fn atom(&mut self, s: &str) -> Atom { STRING_ARENA.lock().unwrap().get_or_intern(s) }
+    fn atom(&mut self, s: &str) -> Atom { Atom(STRING_ARENA.lock().unwrap().get_or_intern(s)) }
 
     fn expect_and_eat_ident_range(&mut self) -> Range<usize> {
         let p = self.it;
-        while self.peek_cp().take_if(|(_, x)| is_ident(*x, false)).is_some() {
+        while let Some(ch) = self.peek_cp() {
+            if !is_ident(ch, false) { break; }
             self.next();
         }
         p..self.it
     }
 
-    fn expect_and_eat_ident(&mut self) -> usize {
+    fn expect_and_eat_ident(&mut self) {
         let range = self.expect_and_eat_ident_range();
         let atom = self.atom(&self.source[range.clone()]);
         self.new_token(if KEYWORDS.is_keyword(atom) {
@@ -888,21 +918,21 @@ impl<'source> Tokenizer<'source> {
         }, range)
     }
 
-    fn try_eat_identifier(&mut self) -> Result<Option<usize>, SyntaxErr<'source>> {
+    fn try_eat_identifier(&mut self) -> Result<(), SyntaxErrRef> {
         let cp = if let Some(cp) = self.peek_cp() {
             cp
         } else {
-            return Ok(None)
+            return Ok(())
         };
 
-        if is_ident(cp.1, true) {
-            Ok(Some(self.expect_and_eat_ident()))
+        if is_ident(cp, true) {
+            Ok(self.expect_and_eat_ident())
         } else {
-            Err(self.syntax_err().loc_msg(self.it..self.it+cp.1.len_utf8(), &format!("unexpected char '{}'", cp.1)))
+            Err(self.syntax_err().loc_msg(self.it..self.it+cp.len_utf8(), &format!("unexpected char '{}'", cp)))
         }
     }
 
-    pub fn syntax_err(&self) -> SyntaxErr<'source> { SyntaxErr::new(self.filename.clone(), self.source) }
+    pub fn syntax_err(&self) -> SyntaxErrRef { PARSER_ARENA.get_or(|| PARSER_ARENA_HERD.get()).alloc(SyntaxErr::new(self.filename.clone(), self.source)) }
 }
 
 fn from_hex(c: u8) -> u32 {
@@ -926,9 +956,9 @@ fn is_digit(c: u8, base: usize) -> bool {
 
 fn is_ident(ch: char, first_char: bool) -> bool {
     if first_char {
-        return ch.is_alphabetic() || ch == '_';
+        ch.is_alphabetic() || ch == '_'
     } else {
-        return ch.is_alphanumeric() || ch == '_';
+        ch.is_alphanumeric() || ch == '_'
     }
 }
 
@@ -945,38 +975,27 @@ const fn utf8_first_byte(byte: u8, width: u32) -> u32 { (byte & (0x7F >> width))
 #[inline]
 const fn utf8_acc_cont_byte(ch: u32, byte: u8) -> u32 { (ch << 6) | (byte & CONT_MASK) as u32 }
 
-fn next_code_point_unchecked<'a>(bytes: &[u8]) -> char {
-    // Decode UTF-8
-    let x = bytes[0];
+fn next_code_point(bytes: *const u8) -> char {
+    let x = unsafe { *bytes };
     if x < 128 { return unsafe { char::from_u32_unchecked(x as u32) } }
 
     // Multibyte case follows
     // Decode from a byte combination out of: [[[x y] z] w]
     // NOTE: Performance is sensitive to the exact formulation here
     let init = utf8_first_byte(x, 2);
-    // SAFETY: `bytes` produces an UTF-8-like string,
-    // so the indexing must produce a value here.
-    let y = bytes[1];
+
+    let y = unsafe { *bytes.add(1) };
     let mut ch = utf8_acc_cont_byte(init, y);
     if x >= 0xE0 {
         // [[x y z] w] case
         // 5th bit in 0xE0 .. 0xEF is always clear, so `init` is still valid
-        // SAFETY: `bytes` produces an UTF-8-like string,
-        // so the indexing must produce a value here.
-        let y_z = utf8_acc_cont_byte((y & CONT_MASK) as u32, bytes[2]);
+        let y_z = utf8_acc_cont_byte((y & CONT_MASK) as u32, unsafe { *bytes.add(2) });
         ch = init << 12 | y_z;
         if x >= 0xF0 {
             // [x y z w] case
             // use only the lower 3 bits of `init`
-            // SAFETY: `bytes` produces an UTF-8-like string,
-            // so the indexing must produce a value here.
-            ch = (init & 7) << 18 | utf8_acc_cont_byte(y_z,  bytes[3]);
+            ch = (init & 7) << 18 | utf8_acc_cont_byte(y_z, unsafe { *bytes.add(3) });
         }
     }
     unsafe { char::from_u32_unchecked(ch) }
-}
-
-fn next_code_point(bytes: &[u8]) -> Option<char> {
-    if bytes.len() == 0 { return None; }
-    Some(next_code_point_unchecked(bytes))
 }
