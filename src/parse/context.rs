@@ -43,6 +43,7 @@ pub struct Keywords {
     pub r#while: Atom,
     pub with: Atom,
     pub r#yield: Atom,
+    pub r#type: Atom,
 }
 
 lazy_static! {

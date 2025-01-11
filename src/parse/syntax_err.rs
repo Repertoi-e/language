@@ -25,7 +25,7 @@ pub struct SyntaxErr {
     pub filename: Option<String>,
     pub source: &'static str,
 
-    pub in_interactive_interpreter_should_discard_and_instead_read_more_lines: bool, // For unescaped brackets or multiline string literals
+    pub in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines: bool, // For unescaped brackets or multiline string literals
 
     pub loc: Range<usize>,
     pub msg: String,
@@ -45,7 +45,7 @@ impl<'source> SyntaxErr {
         Self {
             filename,
             source: source,
-            in_interactive_interpreter_should_discard_and_instead_read_more_lines: false,
+            in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines: false,
             loc: 0..0,
             msg: String::new(),
             help_msg: None,
@@ -139,8 +139,8 @@ impl<'source> SyntaxErr {
         self
     }
 
-    pub fn in_interactive_interpreter_should_discard_and_instead_read_more_lines(&mut self, should_it: bool) -> &mut Self {
-        self.in_interactive_interpreter_should_discard_and_instead_read_more_lines = should_it;
+    pub fn in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines(&mut self, should_it: bool) -> &mut Self {
+        self.in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines = should_it;
         self
     }
 }

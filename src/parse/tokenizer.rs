@@ -247,7 +247,7 @@ impl Tokenizer {
                                begin_p..self.it,
                                 "string literal was not ended",
                             ).suggestion(self.it, parse_until, "end the string")
-                            .in_interactive_interpreter_should_discard_and_instead_read_more_lines(is_multiline)
+                            .in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines(is_multiline)
                         );
                     }
                 }
@@ -884,7 +884,7 @@ impl Tokenizer {
                         else { "multiline comment was not closed, in nested multiline comments each one must be closed" }
                     )
                     .suggestion(self.source.len(), "*/", "close the comment")
-                    .in_interactive_interpreter_should_discard_and_instead_read_more_lines(true)
+                    .in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines(true)
                 );
             }
             if self.match_sequence("/*") {

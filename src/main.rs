@@ -171,7 +171,7 @@ fn main() {
                 // Tokens and the Ast need to refer to the source they were parsed from.
                 let source = parser_arena.alloc_str(&input);
                 if let Err(e) = parse(None, source) { 
-                    if e.in_interactive_interpreter_should_discard_and_instead_read_more_lines {
+                    if e.in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines {
                         input.push('\n');
 
                         continue; // To read another line and try again
