@@ -4,6 +4,7 @@ use std::{
 };
 
 use bumpalo::{BumpSync, Herd};
+use display_tree::println_tree;
 use lazy_static::lazy_static;
 use thread_local::ThreadLocal;
 
@@ -87,10 +88,26 @@ macro_rules! eat_ident {
         if let Some(t) = eat!($self, TokenValue::Identifier(_)) {
             if let TokenValue::Identifier(name) = t.value {
                 Some(name)
+            } else {
+                None
             }
-            unreachable!();
+        } else {
+            None
         }
-        None
+    }};
+}
+
+macro_rules! eat_number {
+    ($self:ident) => {{
+        if let Some(t) = eat!($self, TokenValue::Number(_)) {
+            if let TokenValue::Number(literal) = t.value {
+                Some(literal)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }};
 }
 
@@ -98,7 +115,7 @@ macro_rules! eat_keyword {
     ($self:ident, $keyword:expr) => {{
         if let Some(t) = eat!($self, TokenValue::Keyword(_)) {
             if let TokenValue::Keyword(keyword) = t.value {
-                if keyword == KEYWORDS.$keyword {
+                if keyword == $keyword {
                     Some(t)
                 } else {
                     $self.it -= 1;
@@ -172,15 +189,14 @@ impl Parser {
     //
     pub fn parse(&mut self) -> Result<AstRef, SyntaxErrRef> {
         let p = self.it;
-
-        let mut statements: Vec<AstRef, _> = Vec::new_in(self.ast_arena);
+        let mut statements: Vec<AstRef, _> = Vec::new_in(self.parser_arena);
 
         loop {
             let t = self.peek_token();
             if t.is_none() {
                 break;
-            } else if matches!(t, token_value!(TokenValue::NewLine)) {
-                self.next_token();
+            } else if eat!(self, TokenValue::NewLine).is_some() {
+                statements.push(self.new_ast(AstKind::Blank, self.it - 1..self.it));
                 continue;
             } else if let Some(statement) = self.parse_statement()? {
                 let next = self.peek_token();
@@ -190,8 +206,7 @@ impl Parser {
                         self.peek_nth_token(i),
                         token_value!(TokenValue::ClosedBracket)
                     ) {
-                        let p = self.peek_nth_token(i);
-                        if p.is_none() {
+                        if self.peek_nth_token(i).is_none() {
                             let start = next.unwrap().loc.range.start;
                             return Err(self
                                 .syntax_err()
@@ -220,7 +235,7 @@ impl Parser {
 
         Ok(self.new_ast(
             AstKind::Module {
-                body: AstVecOf::<AstRef>(statements),
+                body: AstVecOf(statements),
             },
             p..self.it,
         ))
@@ -235,8 +250,7 @@ impl Parser {
     }
 
     /*
-    # NOTE: assignment MUST precede expression, else parsing a simple assignment
-    # will throw a SyntaxError.
+    # NOTE: Assignment must precede expression.
     //
     simple_stmt[stmt_ty] (memo):
     | assignment
@@ -258,15 +272,26 @@ impl Parser {
         let ast;
         if let Some(assignment) = self.parse_assignment()? {
             ast = assignment;
-        } else if eat_keyword!(self, r#type).is_some() {
-            ast = self.parse_type_alias()?;
+        } else if let Some(type_alias) = self.parse_type_alias()? {
+            ast = type_alias;
         } else if let Some(star_expressions) = self.parse_star_expressions()? {
-            ast = star_expressions;
+            let token_range = star_expressions.token_range.clone();
+            println!("token range {:?}", token_range);
+            ast = self.new_ast(
+                AstKind::Expression {
+                    value: star_expressions,
+                },
+                token_range,
+            );
+        } else if let Some(return_statement) = self.parse_return_statement()? {
+            ast = return_statement;
         } else {
             return Ok(None);
         }
 
-        let range = self.token_range(ast);
+        println_tree!(ast);
+
+        let range = self.source_range(ast);
         if matches!(
             self.peek_token(),
             None | token_value!(TokenValue::SemiColon)
@@ -289,8 +314,30 @@ impl Parser {
                         .suggestion(range.end, "\n", "... or end the line here")
                 },
             )?;
+            self.next_token();
         }
         Ok(Some(ast))
+    }
+
+    /*
+    return_stmt[stmt_ty]:
+        | 'return' a=[star_expressions] { _PyAST_Return(a, EXTRA) }
+    */
+    fn parse_return_statement(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        if eat_keyword!(self, KEYWORDS.r#return).is_some() {
+            let star_expressions = self.parse_star_expressions()?;
+            return Ok(Some(self.new_ast(
+                AstKind::Return {
+                    value: AstOption(star_expressions),
+                },
+                p..self.it,
+            )));
+        }
+
+        self.it = p;
+        Ok(None)
     }
 
     /*
@@ -299,40 +346,215 @@ impl Parser {
         CHECK_VERSION(stmt_ty, 12, "Type statement is",
         _PyAST_TypeAlias(CHECK(expr_ty, _PyPegen_set_expr_context(p, n, Store)), t, b, EXTRA)) }
     */
-    fn parse_type_alias(&mut self) -> Result<AstRef, SyntaxErrRef> {
+    fn parse_type_alias(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        // "type" keyword already is already eaten
+        if eat_keyword!(self, KEYWORDS.r#type).is_some() {
+            if let Some(name) = eat_ident!(self) {
+                let type_params = self.parse_type_params()?;
 
-        if let _ = eat_ident!(self) {}
+                if eat!(self, TokenValue::Equal).is_some() {
+                    if let Some(expression) = self.parse_expression()? {
+                        return Ok(Some(self.new_ast(
+                            AstKind::TypeAlias {
+                                name,
+                                type_params: AstOption(type_params),
+                                value: expression,
+                            },
+                            p..self.it,
+                        )));
+                    }
+                }
+            }
+        }
 
-        let type_params = if let Some(type_params) = self.parse_type_params()? {
-            type_params
-        } else {
-            return Err(self
-                .syntax_err()
-                .loc_msg(p..p + 1, "expected type parameters"));
-        };
+        self.it = p;
+        Ok(None)
+    }
 
-        expect!(self, self.next_token(), token_value!(TokenValue::Equals)).map_err(|(_, s)| {
-            s.msg("expected '=' after type parameters")
-                .loc_msg(p..self.it, "this is the type alias statement")
-        })?;
+    /*
+    type_params[asdl_type_param_seq*]:
+    | invalid_type_params
+    | '[' t=type_param_seq ']' {
+        CHECK_VERSION(asdl_type_param_seq *, 12, "Type parameter lists are", t) }
+    */
+    fn parse_type_params(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
 
-        let expression = if let Some(expr) = self.parse_expression()? {
-            expr
-        } else {
-            return Err(self.syntax_err().loc_msg(p..p + 1, "expected expression"));
-        };
+        println!("Parsing type params {:?}", self.peek_token());
 
-        Ok(self.new_ast(
-            AstKind::TypeAlias {
-                name,
-                type_params,
-                expression,
-            },
-            p..self.it,
-        ))
+        if let Some(ob) = eat!(self, TokenValue::OpenSquareBracket) {
+            if eat!(self, TokenValue::ClosedSquareBracket).is_some() {
+                return Err(self.syntax_err().loc_msg(
+                    ob.loc.range.start..ob.loc.range.end + 1,
+                    "type parameter list cannot be empty",
+                ));
+            }
+
+            if let Some(type_param_seq) = self.parse_type_param_seq()? {
+                if eat!(self, TokenValue::ClosedSquareBracket).is_some() {
+                    return Ok(Some(type_param_seq));
+                } else {
+                    return Err(self
+                        .syntax_err()
+                        .loc_msg(p..self.it, "bracket not closed")
+                        .annotation(
+                            Level::Info,
+                            p..self.it,
+                            "for these type params",
+                            false,
+                        )
+                        .suggestion(self.it, "]", "close bracket")
+                        .in_interactive_interpreter_should_discard_syntax_error_and_instead_read_more_lines(
+                            true,
+                    ));
+                }
+            }
+        }
+
+        self.it = p;
+        Ok(None)
+    }
+
+    /*
+    type_param_starred_default[expr_ty]:
+        '=' e=star_expression {CHECK_VERSION(expr_ty, 13, "Type parameter defaults are", e) }
+    */
+    fn parse_type_param_starred_default(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        if eat!(self, TokenValue::Equal).is_some() {
+            if let Some(star_expression) = self.parse_star_expression()? {
+                return Ok(Some(star_expression));
+            }
+        }
+
+        self.it = p;
+        Ok(None)
+    }
+
+    /*
+    type_param_default[expr_ty]:
+        '=' e=expression {CHECK_VERSION(expr_ty, 13, "Type parameter defaults are", e) }
+    */
+    fn parse_type_param_default(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        if eat!(self, TokenValue::Equal).is_some() {
+            if let Some(expression) = self.parse_expression()? {
+                return Ok(Some(expression));
+            }
+        }
+
+        self.it = p;
+        Ok(None)
+    }
+
+    /*
+    type_param_bound[expr_ty]:
+        ':' e=expression { e }
+    */
+    fn parse_type_param_bound(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        if eat!(self, TokenValue::Colon).is_some() {
+            if let Some(expression) = self.parse_expression()? {
+                return Ok(Some(expression));
+            }
+        }
+
+        self.it = p;
+        Ok(None)
+    }
+
+    /*
+    type_param[type_param_ty] (memo):
+    | a=NAME b=[type_param_bound] c=[type_param_default] { _PyAST_TypeVar(a->v.Name.id, b, c, EXTRA) }
+    | invalid_type_param
+    | '*' a=NAME b=[type_param_starred_default] { _PyAST_TypeVarTuple(a->v.Name.id, b, EXTRA) }
+    | '**' a=NAME b=[type_param_default] { _PyAST_ParamSpec(a->v.Name.id, b, EXTRA) }
+    */
+    fn parse_type_param(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        if let Some(name) = eat_ident!(self) {
+            let bound = self.parse_type_param_bound()?;
+            let default = self.parse_type_param_default()?;
+
+            return Ok(Some(self.new_ast(
+                AstKind::TypeVar {
+                    name,
+                    bound: AstOption(bound),
+                    default: AstOption(default),
+                },
+                p..self.it,
+            )));
+        } else if eat!(self, TokenValue::Times).is_some() {
+            if let Some(name) = eat_ident!(self) {
+                let default = self.parse_type_param_starred_default()?;
+
+                return Ok(Some(self.new_ast(
+                    AstKind::TypeVarTuple {
+                        name,
+                        default: AstOption(default),
+                    },
+                    p..self.it,
+                )));
+            }
+        } else if eat!(self, TokenValue::Power).is_some() {
+            if let Some(name) = eat_ident!(self) {
+                let default = self.parse_type_param_default()?;
+
+                return Ok(Some(self.new_ast(
+                    AstKind::ParamSpec {
+                        name,
+                        default: AstOption(default),
+                    },
+                    p..self.it,
+                )));
+            }
+        }
+        self.it = p;
+        Ok(None)
+    }
+
+    /*
+    type_param_seq[asdl_type_param_seq*]:
+        a[asdl_type_param_seq*]=','.type_param+ [','] { a }
+     */
+    fn parse_type_param_seq(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
+        let p = self.it;
+
+        let mut type_params = Vec::<AstRef, _>::new_in(self.parser_arena);
+        loop {
+            println!("-- loop type param {:?}", self.peek_token());
+
+            if let Some(type_param) = self.parse_type_param()? {
+                type_params.push(type_param);
+            } else {
+                break;
+            }
+
+            if eat!(self, TokenValue::Comma).is_none() {
+                break;
+            }
+        }
+
+        if !type_params.is_empty() {
+            eat!(self, TokenValue::Comma); // Optional trailing comma
+
+            if type_params.len() == 1 {
+                return Ok(Some(type_params.pop().unwrap()));
+            } else {
+                return Ok(Some(self.new_ast(
+                    AstKind::TypeParamSeq {
+                        params: AstVecOf(type_params),
+                    },
+                    p..self.it,
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /*
@@ -367,7 +589,7 @@ impl Parser {
                     target.token_range = p..self.it;
                     return Ok(Some(target));
                 } else {
-                    let target_range = range(&t.loc.range, &self.token_range(target));
+                    let target_range = range(&t.loc.range, &self.source_range(target));
                     return Err(self
                         .syntax_err()
                         .loc_msg(t.loc.range, "bracket not closed")
@@ -485,7 +707,7 @@ impl Parser {
         let p = self.it;
 
         if matches!(self.peek_token(), token_value!(TokenValue::Comma)) {
-            let mut targets = Vec::<AstRef, _>::new_in(self.ast_arena);
+            let mut targets = Vec::<AstRef, _>::new_in(self.parser_arena);
             targets.push(first_target);
 
             while eat!(self, TokenValue::Comma).is_some() {
@@ -497,7 +719,7 @@ impl Parser {
             }
             return Ok(Some(self.new_ast(
                 AstKind::Tuple {
-                    targets: AstSingleOrMultiple::Multiple(AstVecOf::<AstRef>(targets)),
+                    targets: AstSingleOrMultiple::Multiple(AstVecOf(targets)),
                     ctx: ExprContext::Store,
                 },
                 p..self.it,
@@ -524,14 +746,14 @@ impl Parser {
             let p = self.it;
             if matches!(self.peek_token(), token_value!(TokenValue::SemiColon)) {
                 self.next_token();
-                first_statement = self.new_ast(AstKind::EmptyStatement, p..p + 1);
+                first_statement = self.new_ast(AstKind::Blank, p..p + 1);
             } else {
                 return Ok(None);
             }
         }
 
         if !matches!(self.peek_token(), None | token_value!(TokenValue::NewLine)) {
-            let mut statements = Vec::<AstRef, _>::new_in(self.ast_arena);
+            let mut statements = Vec::<AstRef, _>::new_in(self.parser_arena);
             statements.push(first_statement);
 
             loop {
@@ -541,7 +763,7 @@ impl Parser {
                         self.peek_token(),
                         None | token_value!(TokenValue::SemiColon | TokenValue::NewLine)
                     ) {
-                        statements.push(self.new_ast(AstKind::EmptyStatement, p..p + 1));
+                        statements.push(self.new_ast(AstKind::Blank, p..p + 1));
                         continue;
                     }
                 }
@@ -558,7 +780,7 @@ impl Parser {
             }
             return Ok(Some(self.new_ast(
                 AstKind::Statements {
-                    statements: AstVecOf::<AstRef>(statements),
+                    statements: AstVecOf(statements),
                 },
                 p..self.it,
             )));
@@ -617,14 +839,14 @@ impl Parser {
 
         while eat!(self, TokenValue::BitwiseOr).is_some() {
             if let Some(right) = self.parse_bitwise_xor()? {
-                let prev_left_range = self.token_range(left);
+                let prev_left_start = left.token_range.start;
                 left = self.new_ast(
                     AstKind::BinOp {
                         left,
                         op: BinOp::BitOr,
                         right,
                     },
-                    prev_left_range.start..self.it,
+                    prev_left_start..self.it,
                 );
             } else {
                 break;
@@ -650,14 +872,14 @@ impl Parser {
             let p = self.it;
             if eat!(self, TokenValue::Plus).is_some() {
                 if let Some(right) = self.parse_term()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::Add,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -665,14 +887,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::Minus).is_some() {
                 if let Some(right) = self.parse_term()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::Sub,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -706,14 +928,14 @@ impl Parser {
             let p = self.it;
             if eat!(self, TokenValue::Times).is_some() {
                 if let Some(right) = self.parse_factor()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::Mult,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -721,14 +943,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::Divide).is_some() {
                 if let Some(right) = self.parse_factor()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::Div,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -736,14 +958,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::DivideFloor).is_some() {
                 if let Some(right) = self.parse_factor()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::FloorDiv,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -751,14 +973,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::Mod).is_some() {
                 if let Some(right) = self.parse_factor()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::Mod,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -766,14 +988,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::At).is_some() {
                 if let Some(right) = self.parse_factor()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::MatMult,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -855,14 +1077,14 @@ impl Parser {
 
         while eat!(self, TokenValue::Power).is_some() {
             if let Some(right) = self.parse_factor()? {
-                let prev_left_range = self.token_range(left);
+                let prev_left_start = left.token_range.start;
                 left = self.new_ast(
                     AstKind::BinOp {
                         left,
                         op: BinOp::Pow,
                         right,
                     },
-                    prev_left_range.start..self.it,
+                    prev_left_start..self.it,
                 );
             } else {
                 break;
@@ -881,7 +1103,7 @@ impl Parser {
     fn parse_await_primary(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        if let Some(_) = eat_keyword!(self, r#await) {
+        if let Some(_) = eat_keyword!(self, KEYWORDS.r#await) {
             if let Some(primary) = self.parse_primary()? {
                 return Ok(Some(
                     self.new_ast(AstKind::Await { value: primary }, p..self.it),
@@ -920,16 +1142,18 @@ impl Parser {
 
         let mut p = self.it;
         loop {
-            if let Some(dot) = eat!(self, TokenValue::Dot) {
+            println!("-- loop primary {:?}", self.peek_token());
+
+            if eat!(self, TokenValue::Dot).is_some() {
                 if let Some(attr) = eat_ident!(self) {
-                    let prev_ast_range = self.token_range(ast);
+                    let prev_ast_start = ast.token_range.start;
                     ast = self.new_ast(
                         AstKind::Attribute {
                             value: ast,
                             attribute: attr,
                             ctx: ExprContext::Load,
                         },
-                        prev_ast_range.start..self.it,
+                        prev_ast_start..self.it,
                     );
                     p = self.it;
                     continue;
@@ -937,6 +1161,9 @@ impl Parser {
                     break;
                 }
             } else if let Some(bracket) = eat!(self, TokenValue::OpenSquareBracket) {
+                println!("-- found SLICE {:?}", self.peek_token());
+                
+                
                 let should_stop_brackets = !self.inside_brackets;
                 self.inside_brackets = true;
 
@@ -946,19 +1173,19 @@ impl Parser {
                             self.inside_brackets = false;
                         }
 
-                        let prev_ast_range = self.token_range(ast);
+                        let prev_ast_start = ast.token_range.start;
                         ast = self.new_ast(
                             AstKind::Subscript {
                                 value: ast,
                                 slice: slices,
                                 ctx: ExprContext::Load,
                             },
-                            prev_ast_range.start..self.it,
+                            prev_ast_start..self.it,
                         );
                         p = self.it;
                         continue;
                     } else {
-                        let target_range = range(&bracket.loc.range, &self.token_range(slices));
+                        let target_range = range(&bracket.loc.range, &self.source_range(slices));
 
                         return Err(self
                             .syntax_err()
@@ -982,14 +1209,14 @@ impl Parser {
                     break;
                 }
             } else if let Some((pargs, kwargs)) = self.parse_arguments()? {
-                let prev_ast_range = self.token_range(ast);
+                let prev_ast_start = ast.token_range.start;
                 ast = self.new_ast(
                     AstKind::Call {
                         func: ast,
                         args: AstOption(pargs),
                         keywords: AstOption(kwargs),
                     },
-                    prev_ast_range.start..self.it,
+                    prev_ast_start..self.it,
                 );
                 p = self.it;
                 continue;
@@ -1023,7 +1250,7 @@ impl Parser {
                     } else {
                         let target_range = range(
                             &self.peek_nth_token(0).unwrap().loc.range,
-                            &self.token_range(arguments),
+                            &self.source_range(arguments),
                         );
                         return Err(self
                             .syntax_err()
@@ -1097,14 +1324,14 @@ impl Parser {
 
         while eat!(self, TokenValue::Hat).is_some() {
             if let Some(right) = self.parse_bitwise_and()? {
-                let prev_left_range = self.token_range(left);
+                let prev_left_start = left.token_range.start;
                 left = self.new_ast(
                     AstKind::BinOp {
                         left,
                         op: BinOp::BitXor,
                         right,
                     },
-                    prev_left_range.start..self.it,
+                    prev_left_start..self.it,
                 );
             } else {
                 break;
@@ -1127,14 +1354,14 @@ impl Parser {
 
         while eat!(self, TokenValue::BitwiseAnd).is_some() {
             if let Some(right) = self.parse_shift_expr()? {
-                let prev_left_range = self.token_range(left);
+                let prev_left_start = left.token_range.start;
                 left = self.new_ast(
                     AstKind::BinOp {
                         left,
                         op: BinOp::BitAnd,
                         right,
                     },
-                    prev_left_range.start..self.it,
+                    prev_left_start..self.it,
                 );
             } else {
                 break;
@@ -1160,14 +1387,14 @@ impl Parser {
             let p = self.it;
             if eat!(self, TokenValue::ShiftLeft).is_some() {
                 if let Some(right) = self.parse_sum()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::LeftShift,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -1175,14 +1402,14 @@ impl Parser {
                 }
             } else if eat!(self, TokenValue::ShiftRight).is_some() {
                 if let Some(right) = self.parse_sum()? {
-                    let prev_left_range = self.token_range(left);
+                    let prev_left_start = left.token_range.start;
                     left = self.new_ast(
                         AstKind::BinOp {
                             left,
                             op: BinOp::RightShift,
                             right,
                         },
-                        prev_left_range.start..self.it,
+                        prev_left_start..self.it,
                     );
                 } else {
                     self.it = p;
@@ -1238,7 +1465,7 @@ impl Parser {
         if let Some(star_expression) = self.parse_star_expression()? {
             if eat!(self, TokenValue::Comma).is_some() {
                 if let Some(next) = self.parse_star_expression()? {
-                    let mut expressions = Vec::<AstRef, _>::new_in(self.ast_arena);
+                    let mut expressions = Vec::<AstRef, _>::new_in(self.parser_arena);
                     expressions.push(star_expression);
                     expressions.push(next);
 
@@ -1252,7 +1479,7 @@ impl Parser {
 
                     return Ok(Some(self.new_ast(
                         AstKind::Tuple {
-                            targets: AstSingleOrMultiple::Multiple(AstVecOf::<AstRef>(expressions)),
+                            targets: AstSingleOrMultiple::Multiple(AstVecOf(expressions)),
                             ctx: ExprContext::Load,
                         },
                         p..self.it,
@@ -1270,6 +1497,7 @@ impl Parser {
             return Ok(Some(star_expression));
         }
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1278,7 +1506,8 @@ impl Parser {
 
         // Consecutive strings get appended to each other
 
-        let mut strings = Vec::<StringLiteralRef, _>::new_in(self.ast_arena);
+        let mut strings = Vec::<StringLiteralRef, _>::new_in(self.parser_arena);
+        
         while let Some(next) = self.peek_token() {
             if !matches!(next.value, TokenValue::String(_)) {
                 break;
@@ -1310,37 +1539,28 @@ impl Parser {
     */
     fn parse_slices(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
-
-        println!("--- parse_slices: {:?}", self.peek_token());
+        let mut slices = Vec::<AstRef, _>::new_in(self.parser_arena);
 
         if let Some(slice) = self.parse_slice()? {
-            if eat!(self, TokenValue::Comma).is_none() {
-                return Ok(Some(slice));
+            slices.push(slice);
+            while eat!(self, TokenValue::Comma).is_some() {
+                if let Some(star_expr) = self.parse_star_expression()? {
+                    slices.push(star_expr);
+                } else if let Some(slice) = self.parse_slice()? {
+                    slices.push(slice);
+                } else {
+                    break;
+                }
             }
-            self.it = p;
-        }
-
-        let mut slices = Vec::<AstRef, _>::new_in(self.ast_arena);
-        loop {
-            if let Some(star_expr) = self.parse_star_expression()? {
-                slices.push(star_expr);
-            }
-            if let Some(slice) = self.parse_slice()? {
-                slices.push(slice);
-            } else {
-                break;
-            }
-
-            if eat!(self, TokenValue::Comma).is_none() {
-                break;
-            }
+        } else {
+            return Ok(None);
         }
 
         if !slices.is_empty() {
             let targets = if slices.len() == 1 {
                 AstSingleOrMultiple::Single(slices.pop().unwrap())
             } else {
-                AstSingleOrMultiple::Multiple(AstVecOf::<AstRef>(slices))
+                AstSingleOrMultiple::Multiple(AstVecOf(slices))
             };
 
             return Ok(Some(self.new_ast(
@@ -1352,6 +1572,7 @@ impl Parser {
             )));
         }
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1384,9 +1605,9 @@ impl Parser {
                     )));
                 }
             }
-            self.it = p;
         }
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1429,9 +1650,9 @@ impl Parser {
                         ));
                 }
             }
-            self.it = p;
         }
 
+        self.it = p;
         Ok(None)
 
         // TODO: Helpful errors
@@ -1445,14 +1666,13 @@ impl Parser {
     fn parse_arguments(
         &mut self,
     ) -> Result<Option<(Option<AstRef>, Option<AstRef>)>, SyntaxErrRef> {
+        let p = self.it;
+
         if let Some(begin_bracket) = eat!(self, TokenValue::OpenBracket) {
             let should_stop_brackets = !self.inside_brackets;
             self.inside_brackets = true;
 
             let (pargs, kwargs) = self.parse_args()?;
-            if eat!(self, TokenValue::Comma).is_some() {
-                // Optional trailing comma
-            }
 
             if let Some(_) = eat!(self, TokenValue::ClosedBracket) {
                 if should_stop_brackets {
@@ -1469,27 +1689,27 @@ impl Parser {
 
                         let pargs2_str = if pargs2.is_some() {
                             self.source
-                                .get(self.token_range(pargs2.as_ref().unwrap()))
+                                .get(self.source_range(pargs2.as_ref().unwrap()))
                                 .unwrap()
                         } else {
                             ""
                         };
 
-                        let mut named_suggestions = Vec::<String, _>::new_in(self.ast_arena);
+                        let mut named_suggestions = Vec::<String, _>::new_in(self.parser_arena);
                         if pargs2.is_some() {
                             match &pargs2.as_ref().unwrap().kind {
                                 AstKind::Tuple { targets, .. } => match targets {
                                     AstSingleOrMultiple::Single(target) => {
                                         named_suggestions.push(format!(
                                             "... = {}",
-                                            self.source.get(self.token_range(target)).unwrap()
+                                            self.source.get(self.source_range(target)).unwrap()
                                         ));
                                     }
                                     AstSingleOrMultiple::Multiple(targets) => {
                                         for target in targets.0.iter() {
                                             named_suggestions.push(format!(
                                                 "... = {}",
-                                                self.source.get(self.token_range(target)).unwrap()
+                                                self.source.get(self.source_range(target)).unwrap()
                                             ));
                                         }
                                     }
@@ -1500,7 +1720,7 @@ impl Parser {
 
                         let kwargs1_str = if kwargs.is_some() {
                             self.source
-                                .get(self.token_range(kwargs.as_ref().unwrap()))
+                                .get(self.source_range(kwargs.as_ref().unwrap()))
                                 .unwrap()
                         } else {
                             ""
@@ -1508,7 +1728,7 @@ impl Parser {
 
                         let kwargs2_str = if kwargs2.is_some() {
                             self.source
-                                .get(self.token_range(kwargs2.as_ref().unwrap()))
+                                .get(self.source_range(kwargs2.as_ref().unwrap()))
                                 .unwrap()
                         } else {
                             ""
@@ -1538,9 +1758,7 @@ impl Parser {
 
                 // print parsed args range
                 let args_range =
-                    begin_bracket.loc.range.end..self.token_range(pargs.as_ref().unwrap()).end;
-
-                println!("--- args range: {:?}, self.it: {}", args_range, self.it);
+                    begin_bracket.loc.range.end..self.source_range(pargs.as_ref().unwrap()).end;
 
                 let in_interactive_interpreter_should_it_read_more_lines_for_anticipation_of_closing_bracket =
                     matches!(self.peek_token(), None | token_value!(TokenValue::NewLine));
@@ -1575,6 +1793,7 @@ impl Parser {
             */
         }
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1584,7 +1803,7 @@ impl Parser {
     fn parse_args(&mut self) -> Result<(Option<AstRef>, Option<AstRef>), SyntaxErrRef> {
         // Returns a tuple of (positional_args, keyword_args)
 
-        let mut items = Vec::<AstRef, _>::new_in(self.ast_arena);
+        let mut items = Vec::<AstRef, _>::new_in(self.parser_arena);
         loop {
             if let Some(item) = self.parse_starred_expression()? {
                 items.push(item);
@@ -1606,7 +1825,7 @@ impl Parser {
             let targets = if items.len() == 1 {
                 AstSingleOrMultiple::Single(items.pop().unwrap())
             } else {
-                AstSingleOrMultiple::Multiple(AstVecOf::<AstRef>(items))
+                AstSingleOrMultiple::Multiple(AstVecOf(items))
             };
             let pargs = Some(self.new_ast(
                 AstKind::Tuple {
@@ -1617,11 +1836,14 @@ impl Parser {
             ));
 
             if let Some(kw) = self.parse_kwargs()? {
+                eat!(self, TokenValue::Comma); // Optional trailing comma
                 return Ok((pargs, Some(kw)));
             }
+            eat!(self, TokenValue::Comma); // Optional trailing comma
             return Ok((pargs, None));
         } else {
             if let Some(kw) = self.parse_kwargs()? {
+                eat!(self, TokenValue::Comma); // Optional trailing comma
                 return Ok((None, Some(kw)));
             } else {
                 return Ok((None, None));
@@ -1636,7 +1858,7 @@ impl Parser {
     fn parse_kwargs(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        let mut items = Vec::<AstRef, _>::new_in(self.ast_arena);
+        let mut items = Vec::<AstRef, _>::new_in(self.parser_arena);
         loop {
             if let Some(item) = self.parse_kwarg_or_starred_or_double_starred()? {
                 items.push(item);
@@ -1665,6 +1887,7 @@ impl Parser {
                 range,
             )));
         }
+
         self.it = p;
         Ok(None)
     }
@@ -1675,6 +1898,7 @@ impl Parser {
     //   | invalid_starred_expression
     fn parse_starred_expression(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
+
         if eat!(self, TokenValue::Times).is_some() {
             if let Some(expr) = self.parse_expression()? {
                 return Ok(Some(self.new_ast(
@@ -1684,10 +1908,10 @@ impl Parser {
                     },
                     p..self.it,
                 )));
-            } else {
-                self.it = p;
             }
         }
+
+        self.it = p;
         Ok(None)
     }
 
@@ -1702,6 +1926,7 @@ impl Parser {
     //   | '**' expression
     fn parse_kwarg_or_starred_or_double_starred(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
+
         if let Some(name) = eat_ident!(self) {
             if eat!(self, TokenValue::Equal).is_some() {
                 if let Some(expr) = self.parse_expression()? {
@@ -1715,7 +1940,6 @@ impl Parser {
                     )));
                 }
             }
-            self.it = p;
         } else if eat!(self, TokenValue::Power).is_some() {
             if let Some(expr) = self.parse_expression()? {
                 return Ok(Some(self.new_ast(
@@ -1726,7 +1950,6 @@ impl Parser {
                     p..self.it,
                 )));
             }
-            self.it = p;
         } else if let Some(star) = self.parse_starred_expression()? {
             return Ok(Some(self.new_ast(
                 AstKind::Starred {
@@ -1750,6 +1973,7 @@ impl Parser {
             RAISE_SYNTAX_ERROR_KNOWN_RANGE(a, b, "cannot assign to keyword argument unpacking") }
          */
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1780,9 +2004,9 @@ impl Parser {
         let p = self.it;
 
         if let Some(disjunction) = self.parse_disjunction()? {
-            if eat_keyword!(self, r#if).is_some() {
+            if eat_keyword!(self, KEYWORDS.r#if).is_some() {
                 if let Some(disjunction2) = self.parse_disjunction()? {
-                    if eat_keyword!(self, r#else).is_some() {
+                    if eat_keyword!(self, KEYWORDS.r#else).is_some() {
                         if let Some(expr) = self.parse_expression()? {
                             return Ok(Some(self.new_ast(
                                 AstKind::IfExp {
@@ -1796,14 +2020,18 @@ impl Parser {
                     }
                 }
                 self.it = p;
+            } else {
+                return Ok(Some(disjunction));
             }
-            return Ok(Some(disjunction));
-        } /*else if let Some(lambdef) = self.parse_lambdef()? {
-              Ok(Some(lambdef))
-          }*/
+        }
+
+        /*else if let Some(lambdef) = self.parse_lambdef()? {
+            Ok(Some(lambdef))
+        }*/
 
         // TODO: Helpful errors
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1828,8 +2056,6 @@ impl Parser {
                                 },
                                 p..self.it,
                             )));
-                        } else {
-                            self.it = p;
                         }
                     } else {
                         return Ok(Some(self.new_ast(
@@ -1841,8 +2067,6 @@ impl Parser {
                             p..self.it,
                         )));
                     }
-                } else {
-                    self.it = p;
                 }
             } else {
                 return Ok(Some(expr));
@@ -1851,6 +2075,7 @@ impl Parser {
             return Ok(Some(named_expr));
         }
 
+        self.it = p;
         Ok(None)
     }
 
@@ -1865,7 +2090,7 @@ impl Parser {
     fn parse_disjunction(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        let mut conjunctions = Vec::<AstRef, _>::new_in(self.ast_arena);
+        let mut conjunctions = Vec::<AstRef, _>::new_in(self.parser_arena);
         loop {
             if let Some(conjunction) = self.parse_conjunction()? {
                 conjunctions.push(conjunction);
@@ -1873,7 +2098,7 @@ impl Parser {
                 break;
             }
 
-            if eat_keyword!(self, or).is_none() {
+            if eat_keyword!(self, KEYWORDS.or).is_none() {
                 break;
             }
         }
@@ -1883,7 +2108,7 @@ impl Parser {
                 return Ok(Some(self.new_ast(
                     AstKind::BoolOp {
                         op: BinOp::Or,
-                        values: AstVecOf::<AstRef>(conjunctions),
+                        values: AstVecOf(conjunctions),
                     },
                     p..self.it,
                 )));
@@ -1907,7 +2132,7 @@ impl Parser {
     fn parse_conjunction(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        let mut inversions = Vec::<AstRef, _>::new_in(self.ast_arena);
+        let mut inversions = Vec::<AstRef, _>::new_in(self.parser_arena);
         loop {
             if let Some(inversion) = self.parse_inversion()? {
                 inversions.push(inversion);
@@ -1915,7 +2140,7 @@ impl Parser {
                 break;
             }
 
-            if eat_keyword!(self, and).is_none() {
+            if eat_keyword!(self, KEYWORDS.and).is_none() {
                 break;
             }
         }
@@ -1925,7 +2150,7 @@ impl Parser {
                 return Ok(Some(self.new_ast(
                     AstKind::BoolOp {
                         op: BinOp::And,
-                        values: AstVecOf::<AstRef>(inversions),
+                        values: AstVecOf(inversions),
                     },
                     p..self.it,
                 )));
@@ -1946,7 +2171,7 @@ impl Parser {
     fn parse_inversion(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        if eat_keyword!(self, not).is_some() {
+        if eat_keyword!(self, KEYWORDS.not).is_some() {
             if let Some(inversion) = self.parse_inversion()? {
                 return Ok(Some(self.new_ast(
                     AstKind::UnaryOp {
@@ -1958,6 +2183,7 @@ impl Parser {
             }
             self.it = p;
         }
+
         self.parse_comparison()
     }
 
@@ -1975,8 +2201,8 @@ impl Parser {
         let p = self.it;
 
         if let Some(bitwise_or) = self.parse_bitwise_or()? {
-            let mut ops = Vec::new_in(self.ast_arena);
-            let mut exprs = Vec::new_in(self.ast_arena);
+            let mut ops = Vec::new_in(self.parser_arena);
+            let mut exprs = Vec::new_in(self.parser_arena);
 
             while let Some((op, expr)) = self.parse_compare_op_bitwise_or_pair()? {
                 ops.push(op);
@@ -1988,7 +2214,7 @@ impl Parser {
                     AstKind::Compare {
                         left: bitwise_or,
                         ops: AstVecOf::<BinOp>(ops),
-                        comparators: AstVecOf::<AstRef>(exprs),
+                        comparators: AstVecOf(exprs),
                     },
                     p..self.it,
                 )));
@@ -2084,19 +2310,14 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let p = self.it;
 
-        if let Some(t) = eat!(self, TokenValue::Number(_)) {
-            if let TokenValue::Number(literal) = t.value {
-                return Ok(Some(self.new_ast(
-                    AstKind::Constant {
-                        value: ConstantValue::Number(literal),
-                    },
-                    p..p + 1,
-                )));
-            }
-            unreachable!();
-        }
-
-        if let Some(name) = eat_ident!(self) {
+        if let Some(number) = eat_number!(self) {
+            return Ok(Some(self.new_ast(
+                AstKind::Constant {
+                    value: ConstantValue::Number(number),
+                },
+                p..p + 1,
+            )));
+        } else if let Some(name) = eat_ident!(self) {
             return Ok(Some(self.new_ast(
                 AstKind::Name {
                     name,
@@ -2104,23 +2325,21 @@ impl Parser {
                 },
                 p..p + 1,
             )));
-        }
-
-        if let Some(_) = eat_keyword!(self, True) {
+        } else if let Some(_) = eat_keyword!(self, KEYWORDS.True) {
             return Ok(Some(self.new_ast(
                 AstKind::Constant {
                     value: ConstantValue::Bool(true),
                 },
                 p..p + 1,
             )));
-        } else if let Some(_) = eat_keyword!(self, False) {
+        } else if let Some(_) = eat_keyword!(self, KEYWORDS.False) {
             return Ok(Some(self.new_ast(
                 AstKind::Constant {
                     value: ConstantValue::Bool(false),
                 },
                 p..p + 1,
             )));
-        } else if let Some(_) = eat_keyword!(self, None) {
+        } else if let Some(_) = eat_keyword!(self, KEYWORDS.None) {
             return Ok(Some(self.new_ast(
                 AstKind::Constant {
                     value: ConstantValue::None,
@@ -2156,52 +2375,43 @@ impl Parser {
     */
     fn parse_t_primary(&mut self) -> Result<Option<AstRef>, SyntaxErrRef> {
         let mut ast;
+
+        // Start with an atom
         if let Some(atom) = self.parse_atom()? {
-            // Start with an atom
             ast = atom;
         } else {
             return Ok(None);
         }
 
         let mut p = self.it;
-        while matches!(self.peek_nth_token(0), token_value!(TokenValue::Dot)) {
-            if matches!(
-                self.peek_nth_token(1),
-                token_value!(TokenValue::Identifier(_))
-            ) {
-                if matches!(self.peek_nth_token(2), token_value!(TokenValue::Dot)) {
-                    if let TokenValue::Identifier(attr) = self.peek_nth_token(1).unwrap().value {
-                        self.next_token();
-                        self.next_token();
-
-                        let prev_ast_range = self.token_range(ast);
-                        ast = self.new_ast(
-                            AstKind::Attribute {
-                                value: ast,
-                                attribute: attr,
-                                ctx: ExprContext::Load,
-                            },
-                            prev_ast_range.start..self.it,
-                        );
-                        p = self.it;
-                        continue;
-                    }
-                    unreachable!();
-                } else {
-                    break;
+        loop {
+            if eat!(self, TokenValue::Dot).is_some() {
+                if let Some(attribute) = eat_ident!(self) {
+                    let prev_ast_start = ast.token_range.start;
+                    ast = self.new_ast(
+                        AstKind::Attribute {
+                            value: ast,
+                            attribute,
+                            ctx: ExprContext::Load,
+                        },
+                        prev_ast_start..self.it,
+                    );
+                    p = self.it;
+                    continue;
                 }
+                self.it = p;
             } else {
                 break;
-
-                // TODO: Update this else with more lookahead tokens, since its not gonna be the only case
-                /*
-                let loc_p = loc!(self, lookahead);
-                return Err(self.syntax_err()
-                    .loc_msg(loc_p.clone(), "stray dot detected")
-                    .annotation(Level::Info, left_expr, "trying to access into this expression")
-                    .suggestion(loc_p.start, "<ident>", "if you meant to access into the expression, use an identifier after the dot")
-                );*/
             }
+
+            // TODO: Update this else with more lookahead tokens, since its not gonna be the only case
+            /*
+            let loc_p = loc!(self, lookahead);
+            return Err(self.syntax_err()
+                .loc_msg(loc_p.clone(), "stray dot detected")
+                .annotation(Level::Info, left_expr, "trying to access into this expression")
+                .suggestion(loc_p.start, "<ident>", "if you meant to access into the expression, use an identifier after the dot")
+            );*/
         }
 
         // TODO: slices
@@ -2220,24 +2430,18 @@ impl Parser {
         let p = self.it;
         if let Some(t_primary) = self.parse_t_primary()? {
             if eat!(self, TokenValue::Dot).is_some() {
-                if let Some(ident) = eat!(self, TokenValue::Identifier(_)) {
-                    if let TokenValue::Identifier(name) = ident.value {
-                        return Ok(Some(self.new_ast(
-                            AstKind::Attribute {
-                                value: t_primary,
-                                attribute: name,
-                                ctx: ExprContext::Store,
-                            },
-                            p..self.it,
-                        )));
-                    }
-                    unreachable!()
-                } else {
-                    self.it = p;
+                if let Some(attribute) = eat_ident!(self) {
+                    return Ok(Some(self.new_ast(
+                        AstKind::Attribute {
+                            value: t_primary,
+                            attribute,
+                            ctx: ExprContext::Store,
+                        },
+                        p..self.it,
+                    )));
                 }
-            } else {
-                self.it = p;
             }
+            self.it = p;
         }
 
         // TODO slices
@@ -2245,7 +2449,7 @@ impl Parser {
         Ok(None)
     }
 
-    fn token_range(&mut self, ast: &Ast) -> Range<usize> {
+    fn source_range(&mut self, ast: &Ast) -> Range<usize> {
         let start = &self.tokens[ast.token_range.start].loc.range;
         let end = &self.tokens[ast.token_range.end - 1].loc.range;
         range(start, end)
@@ -2262,17 +2466,14 @@ impl Parser {
 
         if let Some(target) = self.parse_single_subscript_attribute_target()? {
             Ok(Some(target))
-        } else if let Some(t) = eat!(self, TokenValue::Identifier(_)) {
-            if let TokenValue::Identifier(name) = t.value {
-                return Ok(Some(self.new_ast(
-                    AstKind::Name {
-                        name,
-                        ctx: ExprContext::Store,
-                    },
-                    p..p + 1,
-                )));
-            }
-            unreachable!();
+        } else if let Some(name) = eat_ident!(self) {
+            return Ok(Some(self.new_ast(
+                AstKind::Name {
+                    name,
+                    ctx: ExprContext::Store,
+                },
+                p..p + 1,
+            )));
         } else if let Some(t) = eat!(self, TokenValue::OpenBracket) {
             let should_stop_brackets = !self.inside_brackets;
             self.inside_brackets = true;
@@ -2287,7 +2488,7 @@ impl Parser {
                     single_target.token_range = p..self.it;
                     Ok(Some(single_target))
                 } else {
-                    let target_range = range(&t.loc.range, &self.token_range(single_target));
+                    let target_range = range(&t.loc.range, &self.source_range(single_target));
                     Err(self
                         .syntax_err()
                         .loc_msg(t.loc.range, "bracket not closed")
@@ -2359,7 +2560,7 @@ impl Parser {
                         if let Some(arhs) = self.parse_annotated_rhs()? {
                             return Ok(Some(self.new_ast(
                                 AstKind::AnnAssign {
-                                    target,
+                                    single_target: target,
                                     annotation: expr,
                                     value: AstOption(Some(arhs)),
                                 },
@@ -2369,7 +2570,7 @@ impl Parser {
                     } else {
                         return Ok(Some(self.new_ast(
                             AstKind::AnnAssign {
-                                target,
+                                single_target: target,
                                 annotation: expr,
                                 value: AstOption(None),
                             },
@@ -2398,7 +2599,7 @@ impl Parser {
                                 if let Some(arhs) = self.parse_annotated_rhs()? {
                                     return Ok(Some(self.new_ast(
                                         AstKind::AnnAssign {
-                                            target: single_target,
+                                            single_target,
                                             annotation: expr,
                                             value: AstOption(Some(arhs)),
                                         },
@@ -2408,7 +2609,7 @@ impl Parser {
                             } else {
                                 return Ok(Some(self.new_ast(
                                     AstKind::AnnAssign {
-                                        target: single_target,
+                                        single_target,
                                         annotation: expr,
                                         value: AstOption(None),
                                     },
@@ -2419,7 +2620,7 @@ impl Parser {
                     }
                 } else {
                     let target_range =
-                        range(&open_bracket.loc.range, &self.token_range(single_target));
+                        range(&open_bracket.loc.range, &self.source_range(single_target));
 
                     return Err(self
                         .syntax_err()
@@ -2451,7 +2652,7 @@ impl Parser {
                         if let Some(arhs) = self.parse_annotated_rhs()? {
                             return Ok(Some(self.new_ast(
                                 AstKind::AnnAssign {
-                                    target,
+                                    single_target: target,
                                     annotation: expr,
                                     value: AstOption(Some(arhs)),
                                 },
@@ -2461,15 +2662,15 @@ impl Parser {
                     } else {
                         return Ok(Some(self.new_ast(
                             AstKind::AnnAssign {
-                                target,
+                                single_target: target,
                                 annotation: expr,
                                 value: AstOption(None),
                             },
                             p..self.it,
                         )));
                     }
-                } 
-            } 
+                }
+            }
             self.it = p;
         }
 
@@ -2477,7 +2678,7 @@ impl Parser {
         if let Some(first_star_targets) = self.parse_star_targets()? {
             if matches!(self.peek_token(), token_value!(TokenValue::Equal)) {
                 let mut chained_targets: Vec<&mut Ast, &BumpSync<'_>> =
-                    Vec::<AstRef, _>::new_in(self.ast_arena);
+                    Vec::<AstRef, _>::new_in(self.parser_arena);
 
                 let mut last_equal = self.it;
                 let mut last_could_parse = true;
@@ -2511,7 +2712,7 @@ impl Parser {
                             ..chained_targets.last().unwrap().token_range.end;
                         target = self.new_ast(
                             AstKind::ChainedTargets {
-                                targets: AstVecOf::<AstRef>(chained_targets),
+                                targets: AstVecOf(chained_targets),
                             },
                             token_range,
                         );
@@ -2526,8 +2727,8 @@ impl Parser {
                         },
                         p..self.it,
                     )));
-                } 
-            } 
+                }
+            }
             self.it = p; // err ?
         }
 

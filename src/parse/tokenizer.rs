@@ -833,7 +833,7 @@ impl Tokenizer {
 
             // Handle other unicode white space
             if let Some(ch) = self.peek_cp() {
-                if !ch.is_whitespace() {
+                if !ch.is_whitespace() || ch == '\n' {
                     break;
                 }
                 let len = ch.len_utf8();

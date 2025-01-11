@@ -44,6 +44,7 @@ pub struct Keywords {
     pub with: Atom,
     pub r#yield: Atom,
     pub r#type: Atom,
+    pub r#return: Atom,
 }
 
 lazy_static! {

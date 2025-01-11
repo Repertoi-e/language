@@ -167,18 +167,23 @@ pub enum AstKind {
         body: AstVec,
     },
 
-    Name {
-        #[tree]
-        name: Atom,
-        ctx: ExprContext,
-    },
-
-    EmptyStatement, // Preserve this for program printing
+    Blank, // Preserve this for program printing
     
     // List of statements on one line
     Statements {
         #[tree]
         statements: AstVec,
+    },
+
+    Return {
+        #[tree]
+        value: AstOption<AstRef>,
+    },
+
+    Name {
+        #[tree]
+        name: Atom,
+        ctx: ExprContext,
     },
 
     Tuple {
@@ -193,27 +198,33 @@ pub enum AstKind {
         targets: AstVec,
     },
 
+    // *<target or expr>
     Starred {
         #[tree]
         value: AstRef, 
         ctx: ExprContext,
     },
 
+    // **kwargs
     DoubleStarred {
         #[tree]
         value: AstRef, 
         ctx: ExprContext,
     },
 
+    // <name> = <value> in arguments list
     KeywordArg {
+        #[field_label]
         arg: Atom,
 
+        #[field_label]
         #[tree]
         value: AstRef,
 
         ctx: ExprContext,
     },
 
+    // <targets> = <value>
     Assign {
         #[field_label]
         #[tree]
@@ -224,10 +235,11 @@ pub enum AstKind {
         value: AstRef,
     },
 
+    // <single target> : <type> = <value>
     AnnAssign {
         #[field_label]
         #[tree]
-        target: AstRef,
+        single_target: AstRef,
 
         #[field_label]
         #[tree]
@@ -278,12 +290,15 @@ pub enum AstKind {
 
     Compare {
         #[tree]
+        #[field_label]
         left: AstRef,
 
         #[tree]
+        #[field_label]
         ops: AstVecOf<BinOp>,
 
         #[tree]
+        #[field_label]
         comparators: AstVec,
     },
 
@@ -301,6 +316,7 @@ pub enum AstKind {
         value: AstRef,
 
         #[tree]
+        #[field_label]
         slice: AstRef,
 
         ctx: ExprContext,
@@ -311,20 +327,25 @@ pub enum AstKind {
         func: AstRef,
 
         #[tree]
+        #[field_label]
         args: AstOption<AstRef>,
 
         #[tree]
+        #[field_label]
         keywords: AstOption<AstRef>,
     },
 
     Slice {
         #[tree]
+        #[field_label]
         lower: AstRef,
 
         #[tree]
+        #[field_label]
         upper: AstRef,
 
         #[tree]
+        #[field_label]
         step: AstOption<AstRef>,
     },
 
@@ -336,20 +357,25 @@ pub enum AstKind {
 
     IfExp {
         #[tree]
+        #[field_label]
         test: AstRef,
 
         #[tree]
+        #[field_label]
         body: AstRef,
 
         #[tree]
+        #[field_label]
         orelse: AstRef,
     },
 
     NamedExpr {
         #[tree]
+        #[field_label]
         target: AstRef,
 
         #[tree]
+        #[field_label]
         value: AstRef,
     },
 
@@ -372,6 +398,58 @@ pub enum AstKind {
         #[field_label]
         #[tree]
         value: AstRef,
+    },
+
+    TypeAlias {
+        #[tree]
+        #[field_label]
+        name: Atom,
+
+        #[tree]
+        #[field_label]
+        type_params: AstOption<AstRef>,
+
+        #[tree]
+        #[field_label]
+        value: AstRef,
+    },
+
+    TypeParamSeq {
+        #[tree]
+        #[field_label]
+        params: AstVec,
+    },
+
+    TypeVarTuple {
+        #[field_label]
+        name: Atom,
+
+        #[tree]
+        #[field_label]
+        default: AstOption<AstRef>,
+    },
+
+    ParamSpec {
+        #[field_label]
+        name: Atom,
+
+        #[tree]
+        #[field_label]
+        default: AstOption<AstRef>,
+    },
+
+    TypeVar {
+        #[tree]
+        #[field_label]
+        name: Atom,
+
+        #[tree]
+        #[field_label]
+        bound: AstOption<AstRef>,
+
+        #[tree]
+        #[field_label]
+        default: AstOption<AstRef>,
     },
 }
 
